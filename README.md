@@ -409,11 +409,17 @@ go build -o doormouse .
 go test -race ./...
 ```
 
+The [container end-to-end suite](e2e/README.md) checks the release image's
+wake/proxy/SSH-shutdown lifecycle, runtime permissions, and config migration:
+
+```bash
+go -C e2e test -race -count=1 -timeout=5m -v ./...
+```
+
 To build a local container image, use Go and Docker:
 
 ```bash
 bash scripts/build-container.sh doormouse:local
-bash scripts/smoke-container.sh doormouse:local
 ```
 
 The build script compiles for your native architecture and packages the binary
