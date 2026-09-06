@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/darksworm/doormouse/compare/v1.0.0...v2.0.0) (2026-09-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* run container images as a non-root user
+
+### Features
+
+* run container images as a non-root user ([679f52c](https://github.com/darksworm/doormouse/commit/679f52c1824fcb7e0e60137302e846153a1617f6))
+
 ## 1.0.0 (2026-08-28)
 
 
