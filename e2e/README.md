@@ -6,7 +6,7 @@ Run from the repository root with Go and a local Linux Docker daemon:
 go -C e2e test -race -count=1 -timeout=5m -v ./...
 ```
 
-The suite compiles the application, builds `Dockerfile.release` once, and uses
+The suite builds the application from source using `Dockerfile` once, and uses
 Testcontainers to manage isolated containers and networks. No prebuilt application
 image, shell script, privileged host ports, or root test runner is required.
 Test dependencies live in this module; ordinary `go test ./...` stays Docker-free.

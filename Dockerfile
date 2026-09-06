@@ -1,6 +1,14 @@
-# Runtime image for released versions. It only packages the binary GoReleaser
-# has already cross-compiled, so the RUN steps below are all the arm64 build has
-# to run under emulation on an amd64 runner.
+# Compile on the builder's native architecture, even for cross-platform images.
+ARG BUILDPLATFORM
+FROM --platform=$BUILDPLATFORM golang:1.24.3-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/doormouse .
+
 FROM alpine:3.22
 
 # Everything that does not need the binary happens before it is copied in, so a
@@ -21,11 +29,9 @@ RUN addgroup -g 1000 doormouse \
 
 WORKDIR /app
 
-# GoReleaser dockers_v2 places each platform's binary under $TARGETPLATFORM/
-ARG TARGETPLATFORM
 # The binary lives outside /app so that /app can be bind-mounted as a whole
 # writable config directory without handing the runtime user its own binary.
-COPY ${TARGETPLATFORM}/doormouse /usr/local/bin/doormouse
+COPY --from=build /out/doormouse /usr/local/bin/doormouse
 
 # doormouse runs as a non-root user, and the kernel would otherwise stop it from
 # binding ports below 1024. This file capability grants that one bind permission,

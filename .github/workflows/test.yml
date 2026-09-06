@@ -77,12 +77,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build the arm64 image
-        run: |
-          mkdir -p arm64-context/linux/arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o arm64-context/linux/arm64/doormouse .
-          docker buildx build --platform linux/arm64 -f Dockerfile.release \
-            --output type=cacheonly arm64-context
+      - name: Build both release architectures
+        run: docker buildx bake release --set release.output=type=cacheonly
 
       - name: Test container end to end
         run: go -C e2e test -race -count=1 -timeout=5m -v ./...

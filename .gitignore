@@ -7,5 +7,5 @@ doormouse
 go-wol-proxy
 *.migrated.toml
 
-# goreleaser output
+# release build output
 dist/

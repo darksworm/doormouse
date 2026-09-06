@@ -47,18 +47,16 @@ func buildSuite(t *testing.T) suite {
 	defer cancel()
 	dir := t.TempDir()
 	platform := "linux/" + runtime.GOARCH
-	must(t, os.MkdirAll(filepath.Join(dir, platform), 0o755))
-	compileGo(t, "..", ".", filepath.Join(dir, platform, "doormouse"))
-	dockerfile, err := os.ReadFile("../Dockerfile.release")
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(dir, "Dockerfile"), dockerfile, 0o644))
+	osName, arch := "linux", runtime.GOARCH
 	var buildLog bytes.Buffer
 	// Create without starting to build the release image once. Keeping this
 	// container until all subtests finish also gives Testcontainers ownership
 	// of image cleanup, including when a test fails.
 	image, err := tc.GenericContainer(ctx, tc.GenericContainerRequest{
 		ContainerRequest: tc.ContainerRequest{FromDockerfile: tc.FromDockerfile{
-			Context: dir, BuildArgs: map[string]*string{"TARGETPLATFORM": &platform},
+			Context: "..", BuildArgs: map[string]*string{
+				"BUILDPLATFORM": &platform, "TARGETOS": &osName, "TARGETARCH": &arch,
+			},
 			BuildLogWriter: &buildLog,
 		}},
 	})

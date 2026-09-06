@@ -416,23 +416,26 @@ wake/proxy/SSH-shutdown lifecycle, runtime permissions, and config migration:
 go -C e2e test -race -count=1 -timeout=5m -v ./...
 ```
 
-To build a local container image, use Go and Docker:
+To build a local container image, only Docker is required:
 
 ```bash
-bash scripts/build-container.sh doormouse:local
+docker build -t doormouse:local .
 ```
 
-The build script compiles for your native architecture and packages the binary
-with `Dockerfile.release`, so local and published images share the same non-root
-runtime. Set `GOARCH=arm64` or `GOARCH=amd64` to cross-build; executing image build
-steps for another architecture requires QEMU/binfmt emulation.
+The multi-stage `Dockerfile` compiles Go inside Docker and packages the binary
+in the same non-root runtime used for releases. No host Go installation is needed.
+With Docker Buildx, `docker buildx bake` also builds and loads `doormouse:local`.
 
-To build both release architectures with [GoReleaser](https://goreleaser.com),
-install Docker Buildx and configure QEMU/binfmt emulation first:
+To check both release architectures (amd64 and arm64), configure QEMU/binfmt
+emulation for the runtime image's build steps, then run:
 
 ```bash
-goreleaser release --config .goreleaser.release.yml --snapshot --clean
+docker buildx bake release --set release.output=type=cacheonly
 ```
+
+The release workflow uses that same Bake target to publish version, minor,
+major, and `latest` tags to GHCR. The GitHub release stays a draft until the
+images have been pushed successfully.
 
 ## Similar projects
 
