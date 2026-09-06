@@ -71,6 +71,8 @@ jobs:
             ./docker-bake.hcl
             cwd://${{ steps.meta.outputs.bake-file }}
           targets: release
+          set: |
+            release.args.VERSION=${{ inputs.tag }}
           push: true
 
       # release-please creates the release as a draft so it only becomes visible

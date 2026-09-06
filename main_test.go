@@ -324,6 +324,32 @@ type noopLogger struct{}
 func (noopLogger) Info(_ string, _ ...interface{})  {}
 func (noopLogger) Error(_ string, _ ...interface{}) {}
 
+type startupLogger struct {
+	info  []string
+	error []string
+}
+
+func (l *startupLogger) Info(msg string, args ...interface{}) {
+	l.info = append(l.info, fmt.Sprintf(msg, args...))
+}
+
+func (l *startupLogger) Error(msg string, args ...interface{}) {
+	l.error = append(l.error, fmt.Sprintf(msg, args...))
+}
+
+func TestLogStartup_LogsDoormouseVersionAtInfoLevel(t *testing.T) {
+	logger := &startupLogger{}
+
+	logStartup(logger, "2.1.0")
+
+	if len(logger.info) != 1 || logger.info[0] != "Starting doormouse version `2.1.0`" {
+		t.Fatalf("info logs = %q, want one startup version line", logger.info)
+	}
+	if len(logger.error) != 0 {
+		t.Fatalf("error logs = %q, want none", logger.error)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------

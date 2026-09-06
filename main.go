@@ -47,6 +47,10 @@ type Logger interface {
 
 const tcpScheme = "tcp://"
 
+// version is replaced by the release build. Keep a useful value for local
+// builds and tests that do not supply linker flags.
+var version = "dev"
+
 // shutdownGrace is how long in-flight requests get to finish on shutdown.
 const shutdownGrace = 15 * time.Second
 
@@ -1728,6 +1732,10 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 	log.Printf("[ERROR] "+msg, args...)
 }
 
+func logStartup(logger Logger, version string) {
+	logger.Info("Starting doormouse version `%s`", version)
+}
+
 // warnUnreadableSSHKeys reports SSH keys the process cannot open. The key is
 // otherwise read only when a machine has gone idle, so a permissions mistake
 // stays invisible until the first shutdown silently fails, up to an
@@ -1760,6 +1768,9 @@ func warnUnreadableSSHKeys(config *ProxyConfig, logger Logger) {
 
 // Main function
 func main() {
+	logger := &StdLogger{}
+	logStartup(logger, version)
+
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: doormouse <config.toml>")
 	}
@@ -1768,7 +1779,6 @@ func main() {
 
 	// Load configuration
 	clock := RealClock{}
-	logger := &StdLogger{}
 
 	MigrateConfigFile(configFile, logger)
 
