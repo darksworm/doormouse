@@ -2,7 +2,7 @@ name: release-pipeline
 
 # On every push to main, release-please keeps a release PR up to date from the
 # conventional-commit history. Merging that PR is what cuts a release: it tags
-# the commit, drafts the release notes, and hands the tag to goreleaser, which
+# the commit, drafts the release notes, and hands the tag to publish-image, which
 # builds and pushes the versioned image before the release goes public.
 on:
   push:
@@ -45,11 +45,11 @@ jobs:
   #
   # If this job fails, the tag and the draft release already exist, so a later
   # push to main will not retry it — release-please only reports
-  # release_created once. Re-run the goreleaser workflow directly instead; it
+  # release_created once. Re-run the publish-image workflow directly instead; it
   # takes the tag as a workflow_dispatch input for exactly this case.
-  goreleaser:
+  publish-image:
     needs: [release-please, test]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
-    uses: ./.github/workflows/goreleaser.yml
+    uses: ./.github/workflows/publish-image.yml
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}

@@ -1,4 +1,4 @@
-name: goreleaser
+name: publish-image
 
 # Builds the release artifacts for an existing tag and pushes the container
 # image. Called by release-pipeline.yml right after release-please cuts a tag,
@@ -22,21 +22,14 @@ permissions:
   packages: write
 
 jobs:
-  goreleaser:
+  publish-image:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tag
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
-          # GoReleaser derives the version from the tag, so a shallow checkout
-          # without tags would make it fall back to a snapshot version.
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
+          persist-credentials: false
 
       # The release image has RUN steps (it creates the runtime user and stamps
       # the port-binding capability on the binary), so building the arm64 image
@@ -54,14 +47,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
         with:
-          distribution: goreleaser
-          version: "~> v2.18"
-          args: release --config .goreleaser.release.yml --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          context: git
+          images: ghcr.io/darksworm/doormouse
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}},value=${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.title=doormouse
+            org.opencontainers.image.description=A reverse proxy that wakes your servers when someone knocks
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Build and push images
+        uses: docker/bake-action@v7
+        with:
+          # Use the checked-out tag, including during manual retries.
+          source: .
+          files: |
+            ./docker-bake.hcl
+            cwd://${{ steps.meta.outputs.bake-file }}
+          targets: release
+          push: true
 
       # release-please creates the release as a draft so it only becomes visible
       # once the image it describes is actually pullable.
