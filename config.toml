@@ -1,10 +1,20 @@
 port = ":8080"                  # Port to listen on for HTTP routes
-timeout = "1m"                  # How long to wait for a machine to wake / a route to become ready
-request_header_timeout = "30s"  # How long to wait for request headers
-response_header_timeout = "1m"  # How long to wait for a response header, e.g. during slow or long-running requests/uploads
-server_read_timeout = "10m"     # How long to wait for the full request body from the client
-server_write_timeout = "10m"    # How long to wait for the full response to the client
-server_idle_timeout = "120s"    # How long to wait for the next request when keep-alive is enabled
+timeout = "1m"                  # How long to wait for a machine to wake / a route to become ready. 
+                                # Cannot be disabled with "0" or a negative value - it would time out immediately.
+request_header_timeout = "30s"  # How long to wait for request headers; 
+                                # Use a negative value (e.g. "-1s") to disable it outright.
+                                # "0" alone falls back to server_read_timeout - 
+                                # Set both to "0" to disable that way
+response_header_timeout = "1m"  # How long to wait for a response header, e.g. during slow or long-running requests/uploads;
+                                # "0" disables it
+server_read_timeout = "10m"     # How long to wait for the full request body from the client;
+                                # "0" disables it
+server_write_timeout = "10m"    # How long to wait for the full response to the client;
+                                # "0" disables it
+server_idle_timeout = "120s"    # How long to wait for the next request when keep-alive is enabled;
+                                # Use a negative value (e.g. "-1s") to disable it outright. 
+                                # "0" alone falls back to server_read_timeout - 
+                                # Set both to "0" to disable that way
 poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust a cached health result
