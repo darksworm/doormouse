@@ -39,10 +39,7 @@ jobs:
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     uses: ./.github/workflows/test.yml
 
-  # No `secrets: inherit`: the called workflow needs nothing beyond
-  # GITHUB_TOKEN, which reusable workflows always get, and inheriting would
-  # hand it RELEASE_PLEASE_TOKEN for no reason.
-  #
+  # Pass only the Docker Hub credentials required by the reusable workflow.
   # If this job fails, the tag and the draft release already exist, so a later
   # push to main will not retry it — release-please only reports
   # release_created once. Re-run the publish-image workflow directly instead; it
@@ -53,3 +50,6 @@ jobs:
     uses: ./.github/workflows/publish-image.yml
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
