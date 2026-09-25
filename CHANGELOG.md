@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.0](https://github.com/darksworm/doormouse/compare/v2.0.0...v2.1.0) (2026-09-24)
+
+
+### Features
+
+* log version on startup ([1756e22](https://github.com/darksworm/doormouse/commit/1756e2217d2a46e9808edf934549bdcfede008c4))
+* more configurable timeout values in config.toml ([#33](https://github.com/darksworm/doormouse/issues/33)) ([46618ee](https://github.com/darksworm/doormouse/commit/46618eee4944bac1c924287dbcd7132b323428b8))
+
 ## [2.0.0](https://github.com/darksworm/doormouse/compare/v1.0.0...v2.0.0) (2026-09-06)
 
 
