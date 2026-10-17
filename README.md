@@ -103,7 +103,7 @@ Point `photos.example.com` at the doormouse host, then open
 >
 > Because host networking does not remap ports, the proxy is reachable on
 > whatever `port` says. Set `port = ":80"` if you want the URL without a port, or
-> put doormouse behind a front proxy that terminates TLS.
+> put doormouse behind a [front proxy](#front-proxy) that terminates TLS.
 
 ## How it works
 
@@ -313,6 +313,80 @@ shutdown_http_url = "http://nas.local/api/shutdown"
 shutdown_http_method = "POST"   # optional, defaults to POST
 shutdown_http_ok_status = 202   # optional, defaults to any 2xx
 ```
+
+## Front proxy
+
+doormouse does one job. It wakes machines when traffic arrives and puts them to
+sleep when it stops. Everything else is left to a reverse proxy in front of it,
+such as nginx, Caddy or Traefik. That covers TLS, authentication, rate limits,
+compression and caching. This is the recommended setup:
+
+```text
+client -> front proxy (TLS, auth, cache, ...) -> doormouse -> machine
+```
+
+Two settings matter on the front proxy:
+
+- **Pass the `Host` header through.** doormouse picks the route from it.
+- **Wait longer than doormouse's `timeout`.** The first request after a sleep
+  waits for the machine to boot. nginx gives up after 60 seconds by default, so
+  raise `proxy_read_timeout` if your `timeout` is longer than that.
+
+### Caching static content
+
+Some content does not need the machine at all: static assets, a landing page, a
+model list. A caching front proxy can serve it while the machine sleeps. With
+nginx:
+
+```nginx
+proxy_cache_path /var/cache/nginx/doormouse keys_zone=doormouse:10m
+                 max_size=1g inactive=30d;
+
+server {
+    listen 80;
+    server_name files.home.com;
+
+    location / {
+        proxy_pass http://doormouse-host:8080;
+        proxy_set_header Host $host;
+        proxy_read_timeout 90s;
+    }
+
+    location /assets/ {
+        proxy_pass http://doormouse-host:8080;
+        proxy_set_header Host $host;
+        proxy_read_timeout 90s;
+
+        proxy_cache doormouse;
+        proxy_cache_valid 200 1d;
+        proxy_cache_use_stale error timeout updating http_502 http_503 http_504;
+        proxy_cache_background_update on;
+        proxy_cache_lock on;
+
+        # Keep logged-in requests out of the cache.
+        proxy_no_cache $http_authorization $http_cookie;
+        proxy_cache_bypass $http_authorization $http_cookie;
+    }
+}
+```
+
+What happens to a request under `/assets/`:
+
+| Cache state | Response | Machine |
+| --- | --- | --- |
+| Fresh | Served from the cache. doormouse never sees the request. | Stays asleep. |
+| Stale | Served from the cache at once. nginx then refreshes it in the background. | Woken by the refresh. |
+| Missing | Sent through doormouse, as usual. | Woken. |
+
+So `proxy_cache_valid` is how long an asset can be served without waking the
+machine. Set `inactive` at least that long. nginx deletes entries nobody has
+asked for within `inactive`, even fresh ones, and the default is only 10
+minutes.
+
+nginx follows the backend's `Cache-Control` and `Expires` headers over
+`proxy_cache_valid`. By default it also skips responses that set a cookie. Any
+proxy that can serve stale content while it refreshes, such as Varnish, works
+the same way.
 
 ## Config validation
 
