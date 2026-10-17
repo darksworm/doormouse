@@ -18,6 +18,12 @@ server_idle_timeout = "120s"    # How long to wait for the next request when kee
 poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust a cached health result
+client_hostname_lookup = false  # Reverse-DNS (PTR) lookup of client IPs for the request log.
+                                # Opt-in: when true, a client IP that is not cached yet is looked
+                                # up synchronously, which can add up to ~1s of latency before the
+                                # incoming-request log line is written and the request is forwarded.
+                                # Results are cached (successes 30m, failures 2m). Set to false to
+                                # log plain IPs only (e.g. slow DNS, no PTR records, many clients).
 
 # Optional SSL configuration. Do not add these values unless you plan to use TLS/HTTPS
 #ssl_certificate = "/path/to/cert.pem"

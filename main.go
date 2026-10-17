@@ -111,6 +111,7 @@ type Config struct {
 	ServerReadTimeout     string         `toml:"server_read_timeout,omitempty"`
 	ServerWriteTimeout    string         `toml:"server_write_timeout,omitempty"`
 	ServerIdleTimeout     string         `toml:"server_idle_timeout,omitempty"`
+	ClientHostnameLookup  *bool          `toml:"client_hostname_lookup,omitempty"`
 	PollInterval          string         `toml:"poll_interval"`
 	HealthCheckInterval   string         `toml:"health_check_interval"`
 	HealthCacheDuration   string         `toml:"health_cache_duration"`
@@ -219,6 +220,7 @@ type ProxyConfig struct {
 	ServerReadTimeout     time.Duration
 	ServerWriteTimeout    time.Duration
 	ServerIdleTimeout     time.Duration
+	ClientHostnameLookup  bool
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
@@ -593,14 +595,17 @@ func (w *UDPWOLSender) createMagicPacket(mac net.HardwareAddr) []byte {
 
 // Main proxy service
 type ProxyService struct {
-	config        *ProxyConfig
-	healthChecker HealthChecker
-	wolSender     WOLSender
-	sshExecutor   SSHExecutor
-	logger        Logger
-	clock         Clock
+	config         *ProxyConfig
+	healthChecker  HealthChecker
+	wolSender      WOLSender
+	sshExecutor    SSHExecutor
+	clientResolver *clientResolver
+	logger         Logger
+	clock          Clock
 }
 
+// NewProxyService wires the configuration to the health checker, WOL sender and
+// SSH executor and returns the running proxy service.
 func NewProxyService(
 	config *ProxyConfig,
 	healthChecker HealthChecker,
@@ -610,12 +615,13 @@ func NewProxyService(
 	clock Clock,
 ) *ProxyService {
 	return &ProxyService{
-		config:        config,
-		healthChecker: healthChecker,
-		wolSender:     wolSender,
-		sshExecutor:   sshExecutor,
-		logger:        logger,
-		clock:         clock,
+		config:         config,
+		healthChecker:  healthChecker,
+		wolSender:      wolSender,
+		sshExecutor:    sshExecutor,
+		clientResolver: newClientResolver(config.ClientHostnameLookup),
+		logger:         logger,
+		clock:          clock,
 	}
 }
 
@@ -884,13 +890,272 @@ func (p *ProxyService) serveOn(server *http.Server, listener net.Listener) error
 // when there is one, so an X-Forwarded-For it set is reported alongside RemoteAddr
 // rather than in place of it. That header is written by the caller and is only as
 // trustworthy as the hop that wrote it — fine for reading logs, not for decisions.
-func clientAddr(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		return fmt.Sprintf("%s (forwarded for %s)", r.RemoteAddr, forwarded)
+// When the network provides PTR records and client_hostname_lookup is enabled,
+// the peer's reverse-DNS hostname is reported alongside the address as well.
+// That lookup is synchronous: on a cache miss it runs, for up to the resolver's
+// timeout, before this returns — so it delays the incoming-request log line and
+// the request itself. Hence the feature is opt-in.
+func (p *ProxyService) clientAddr(r *http.Request) string {
+	addr := r.RemoteAddr
+	if host, ok := p.clientResolver.resolve(clientIP(addr)); ok {
+		addr = fmt.Sprintf("%s (hostname: %s)", addr, host)
 	}
-	return r.RemoteAddr
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		return fmt.Sprintf("%s (forwarded for %s)", addr, forwarded)
+	}
+	return addr
 }
 
+// clientIP extracts the bare IP from an "ip:port" remote address.
+func clientIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return ip
+}
+
+// clientResolver performs best-effort reverse DNS lookups for client IPs so
+// that incoming requests can be logged with the client's hostname when the
+// network provides PTR records. Results (including failures) are cached, so
+// each unique IP triggers at most one lookup per TTL window.
+//
+// A lookup is synchronous: on a cache miss resolve waits for it, bounded by
+// r.timeout, before returning. That wait sits in front of the incoming-request
+// log line and in front of forwarding the request, which is why the feature is
+// opt-in via client_hostname_lookup.
+type clientResolver struct {
+	enabled  bool
+	ttl      time.Duration // how long a successful lookup is trusted
+	negTTL   time.Duration // how long a failed lookup is remembered
+	timeout  time.Duration // max wait for a single lookup
+	resolver *net.Resolver // resolver used for the PTR lookups
+	lookupFn func(ip string, timeout time.Duration) (string, error)
+
+	// maxEntries is a hard ceiling on how many distinct IPs the cache holds.
+	maxEntries int
+
+	mu    sync.RWMutex
+	cache map[string]clientHostEntry
+	// order holds the cache keys oldest insertion first, so freeing a slot is
+	// a walk from the front rather than a scan of the whole map.
+	order []string
+	// inFlight has at most one lookup per IP; concurrent callers share it.
+	inFlight map[string]*clientLookup
+}
+
+// clientHostEntry is one remembered result for an IP.
+type clientHostEntry struct {
+	hostname   string // empty for failed lookups
+	resolvedAt time.Time
+}
+
+// clientLookup is a single in-flight reverse lookup. Concurrent resolvers that
+// ask for the same uncached IP wait on this instead of each starting their own
+// DNS work.
+type clientLookup struct {
+	wg   sync.WaitGroup
+	host string
+	err  error
+}
+
+// maxClientHostCacheEntries is the default hard cap on the number of distinct
+// client IPs the resolver remembers. It is a ceiling, not a target.
+const maxClientHostCacheEntries = 8192
+const maxClientHostLookups = 64
+
+// newClientResolver returns a resolver honouring the configured setting; with
+// enabled false it never looks anything up.
+func newClientResolver(enabled bool) *clientResolver {
+	r := &clientResolver{
+		enabled:    enabled,
+		ttl:        30 * time.Minute,
+		negTTL:     2 * time.Minute,
+		timeout:    time.Second,
+		resolver:   net.DefaultResolver,
+		maxEntries: maxClientHostCacheEntries,
+		cache:      make(map[string]clientHostEntry),
+		inFlight:   make(map[string]*clientLookup),
+	}
+	r.lookupFn = func(ip string, timeout time.Duration) (string, error) {
+		return lookupClientAddr(r.resolver, ip, timeout)
+	}
+	return r
+}
+
+// resolve returns the reverse DNS hostname for ip, or ("", false) when no name
+// is known (or when the resolver is disabled). On a cache miss it blocks while
+// the lookup runs, bounded by r.timeout; concurrent calls for the same IP share
+// that one lookup rather than each triggering their own.
+func (r *clientResolver) resolve(ip string) (string, bool) {
+	if !r.enabled || ip == "" {
+		return "", false
+	}
+	if host, ok := r.cached(ip); ok {
+		return host, host != ""
+	}
+
+	host, err := r.lookupOnce(ip)
+	if err != nil {
+		return "", false
+	}
+	return host, host != ""
+}
+
+// lookupOnce performs the lookup for ip, sharing one in-flight lookup between
+// all concurrent callers for that IP. The caller that started the lookup caches
+// its result, so the others find it cached instead of repeating it.
+func (r *clientResolver) lookupOnce(ip string) (string, error) {
+	r.mu.Lock()
+	if entry, ok := r.cache[ip]; ok && !r.entryExpired(entry, time.Now()) {
+		r.mu.Unlock()
+		return entry.hostname, nil
+	}
+	if call, ok := r.inFlight[ip]; ok {
+		r.mu.Unlock()
+		call.wg.Wait()
+		return call.host, call.err
+	}
+	if len(r.inFlight) >= maxClientHostLookups {
+		r.mu.Unlock()
+		return "", nil
+	}
+	call := &clientLookup{}
+	call.wg.Add(1)
+	r.inFlight[ip] = call
+	r.mu.Unlock()
+
+	host, err := r.lookupFn(ip, r.timeout)
+	if err != nil {
+		host = "" // a failed lookup is cached as "no hostname"
+	} else {
+		host = strings.TrimSuffix(host, ".") // drop FQDN trailing dot
+	}
+	call.host, call.err = host, err
+
+	// Publish the result before releasing anything: the cache entry exists
+	// before the in-flight marker disappears and before the waiters wake. In
+	// the other order a request arriving between the two steps found neither a
+	// cached result nor an in-flight lookup to join, and started a second DNS
+	// lookup for the same IP.
+	r.store(ip, host)
+
+	r.mu.Lock()
+	delete(r.inFlight, ip)
+	r.mu.Unlock()
+
+	call.wg.Done()
+	return host, err
+}
+
+// cached returns the remembered result for ip, and false when nothing is
+// cached for it or the entry has outlived the TTL that applies to it.
+func (r *clientResolver) cached(ip string) (string, bool) {
+	r.mu.RLock()
+	entry, ok := r.cache[ip]
+	r.mu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	if r.entryExpired(entry, time.Now()) {
+		return "", false
+	}
+	return entry.hostname, true
+}
+
+// entryTTL is how long an entry is trusted. Failures are remembered for less
+// time than successes, so a network without PTR records is re-probed sooner
+// while still not being probed on every request.
+func (r *clientResolver) entryTTL(entry clientHostEntry) time.Duration {
+	if entry.hostname == "" {
+		return r.negTTL
+	}
+	return r.ttl
+}
+
+// entryExpired reports whether entry is older than the TTL that applies to it.
+func (r *clientResolver) entryExpired(entry clientHostEntry, now time.Time) bool {
+	return now.Sub(entry.resolvedAt) > r.entryTTL(entry)
+}
+
+// store remembers the result for ip. A new key may not push the cache past
+// r.maxEntries, so room is made for it first; updating an IP that is already
+// cached only replaces its value and never evicts another entry.
+func (r *clientResolver) store(ip, host string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	if _, exists := r.cache[ip]; exists {
+		r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: now}
+		r.touchOrderLocked(ip)
+		return
+	}
+
+	r.makeRoomLocked(now)
+	r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: now}
+	r.order = append(r.order, ip)
+}
+
+// touchOrderLocked moves an already-cached key to the back of the insertion
+// order, making it the most recently resolved entry. Caller holds r.mu.
+func (r *clientResolver) touchOrderLocked(ip string) {
+	for i, k := range r.order {
+		if k == ip {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
+	r.order = append(r.order, ip)
+}
+
+func (r *clientResolver) makeRoomLocked(now time.Time) {
+	if len(r.cache) < r.maxEntries {
+		return
+	}
+	retained := r.order[:0]
+	for _, key := range r.order {
+		entry, ok := r.cache[key]
+		if !ok || r.entryExpired(entry, now) {
+			delete(r.cache, key)
+			continue
+		}
+		retained = append(retained, key)
+	}
+	clear(r.order[len(retained):])
+	r.order = retained
+	for len(r.cache) >= r.maxEntries && len(r.order) > 0 {
+		oldest := r.order[0]
+		r.order = r.order[1:]
+		delete(r.cache, oldest)
+	}
+}
+
+// lookupClientAddr performs a reverse DNS (PTR) lookup through resolver, with
+// the deadline enforced by a context so a slow or unreachable DNS server gets
+// its lookup cancelled at the timeout instead of left running. The first
+// non-empty name in the answer wins; an empty answer is reported as an error.
+func lookupClientAddr(resolver *net.Resolver, ip string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	names, err := resolver.LookupAddr(ctx, ip)
+	if err != nil {
+		return "", err
+	}
+	for _, name := range names {
+		if name != "" {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no PTR record for %s", ip)
+}
+
+// handleRequest serves one request on one route: it resolves the route, logs
+// where the request came from, and either proxies straight through or wakes the
+// machine first. Note that logging the client hostname can itself block on a
+// reverse-DNS lookup when client_hostname_lookup is enabled and the IP is not
+// cached yet.
 func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	route := p.routeForRequest(r)
 
@@ -904,7 +1169,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	machineName := machineState.Name
 
 	p.logger.Info("Incoming request for hostname: %s -> machine: %s, path: %s, client: %s",
-		r.Host, machineName, r.URL.Path, clientAddr(r))
+		r.Host, machineName, r.URL.Path, p.clientAddr(r))
 
 	// Check if we have fresh health data
 	cached, reason := p.healthCacheStatus(machineState)
@@ -1320,7 +1585,9 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	proxy.ServeHTTP(w, r)
 }
 
-// Config loader
+// LoadConfig reads and validates the TOML configuration file at filename,
+// filling in defaults for every optional setting, and returns the resolved
+// ProxyConfig.
 func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	var config Config
 	meta, err := toml.DecodeFile(filename, &config)
@@ -1411,6 +1678,14 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
+	// client_hostname_lookup is optional; unset means disabled. Enabling it is
+	// an explicit opt-in because a cache miss delays the request log line and
+	// the request itself by up to the lookup timeout.
+	clientHostnameLookup := false
+	if config.ClientHostnameLookup != nil {
+		clientHostnameLookup = *config.ClientHostnameLookup
+	}
+
 	if len(config.Targets) > 0 && (len(config.Machines) > 0 || len(config.Routes) > 0) {
 		return nil, fmt.Errorf("config mixes the legacy [[targets]] format with [[machines]]/[[routes]]; use one or the other")
 	}
@@ -1436,6 +1711,7 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		ServerReadTimeout:     serverReadTimeout,
 		ServerWriteTimeout:    serverWriteTimeout,
 		ServerIdleTimeout:     serverIdleTimeout,
+		ClientHostnameLookup:  clientHostnameLookup,
 		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
