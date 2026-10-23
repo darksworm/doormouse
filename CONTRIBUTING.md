@@ -3,8 +3,11 @@
 We welcome pull requests, issues, and other improvements. Please follow the rules below to keep the project easy to maintain.
 
 ## Getting started
-- Fork the repo and create a branch for your change.
-- Make sure to document new features and changes in the README file.
+When contributing to this repository, please first discuss the change you wish to make via issue, email, or any other method with the owners of this repository before making a change.
+
+If you haven't let us know what/how/why you're working on, your contribution might get rejected, but please don't get discouraged - just get a 👍 from one of the maintainers in the issues section and you're ready to rock and roll.
+
+🤖 AI aided/generated contributions are welcome. Just make sure to add proper test coverage!
 
 ## Commit messages
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
