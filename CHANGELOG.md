@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/darksworm/doormouse/compare/v2.1.0...v2.2.0) (2026-10-23)
+
+
+### Features
+
+* log client hostnames via cached reverse DNS lookups ([#39](https://github.com/darksworm/doormouse/issues/39)) ([884ab50](https://github.com/darksworm/doormouse/commit/884ab50d6679c969c0ea6127f4ae2aea8000d9a2))
+
 ## [2.1.0](https://github.com/darksworm/doormouse/compare/v2.0.0...v2.1.0) (2026-09-24)
 
 
