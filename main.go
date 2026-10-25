@@ -106,6 +106,7 @@ func (r *realTicker) Stop()               { r.t.Stop() }
 type Config struct {
 	Port                  string         `toml:"port"`
 	Timeout               string         `toml:"timeout"`
+	StartupTime           string         `toml:"startup_time,omitempty"`
 	RequestHeaderTimeout  string         `toml:"request_header_timeout,omitempty"`
 	ResponseHeaderTimeout string         `toml:"response_header_timeout,omitempty"`
 	ServerReadTimeout     string         `toml:"server_read_timeout,omitempty"`
@@ -124,19 +125,22 @@ type Config struct {
 
 // MachineEntry is a [[machines]] block as written in the config file.
 type MachineEntry struct {
-	Name                 string `toml:"name"`
-	MacAddress           string `toml:"mac_address,omitempty"`
-	BroadcastIP          string `toml:"broadcast_ip,omitempty"`
-	WolPort              int    `toml:"wol_port,omitempty"`
-	HealthCheck          string `toml:"health_check,omitempty"`
-	SSHHost              string `toml:"ssh_host,omitempty"`
-	SSHUser              string `toml:"ssh_user,omitempty"`
-	SSHKeyPath           string `toml:"ssh_key_path,omitempty"`
-	ShutdownCommand      string `toml:"shutdown_command,omitempty"`
-	ShutdownHTTPUrl      string `toml:"shutdown_http_url,omitempty"`
-	ShutdownHTTPMethod   string `toml:"shutdown_http_method,omitempty"`
-	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status,omitempty"`
-	InactivityThreshold  string `toml:"inactivity_threshold,omitempty"`
+	Name                    string `toml:"name"`
+	MacAddress              string `toml:"mac_address,omitempty"`
+	BroadcastIP             string `toml:"broadcast_ip,omitempty"`
+	WolPort                 int    `toml:"wol_port,omitempty"`
+	WolBurstCount           int    `toml:"wol_burst_count,omitempty"`
+	WakeTimeout             string `toml:"wake_timeout,omitempty"`
+	WakeHealthCheckInterval string `toml:"wake_health_check_interval,omitempty"`
+	HealthCheck             string `toml:"health_check,omitempty"`
+	SSHHost                 string `toml:"ssh_host,omitempty"`
+	SSHUser                 string `toml:"ssh_user,omitempty"`
+	SSHKeyPath              string `toml:"ssh_key_path,omitempty"`
+	ShutdownCommand         string `toml:"shutdown_command,omitempty"`
+	ShutdownHTTPUrl         string `toml:"shutdown_http_url,omitempty"`
+	ShutdownHTTPMethod      string `toml:"shutdown_http_method,omitempty"`
+	ShutdownHTTPOKStatus    int    `toml:"shutdown_http_ok_status,omitempty"`
+	InactivityThreshold     string `toml:"inactivity_threshold,omitempty"`
 }
 
 // RouteEntry is a [[routes]] block as written in the config file.
@@ -169,18 +173,21 @@ type Target struct {
 // Machine is a host that is woken, health-checked and shut down as one unit,
 // however many routes point at it.
 type MachineConfig struct {
-	MacAddress           string
-	BroadcastIP          string
-	WolPort              int
-	HealthCheck          string
-	SSHHost              string
-	SSHUser              string
-	SSHKeyPath           string
-	ShutdownCommand      string
-	ShutdownHTTPUrl      string
-	ShutdownHTTPMethod   string
-	ShutdownHTTPOKStatus int
-	InactivityThreshold  time.Duration
+	MacAddress              string
+	BroadcastIP             string
+	WolPort                 int
+	WolBurstCount           int           // WOL packets per burst (1-10, 0 = default)
+	WakeTimeout             time.Duration // per-machine wake bound (0 = global timeout)
+	WakeHealthCheckInterval time.Duration // fixed wake poll (0 = adaptive halving)
+	HealthCheck             string
+	SSHHost                 string
+	SSHUser                 string
+	SSHKeyPath              string
+	ShutdownCommand         string
+	ShutdownHTTPUrl         string
+	ShutdownHTTPMethod      string
+	ShutdownHTTPOKStatus    int
+	InactivityThreshold     time.Duration
 }
 
 // Route is one way in to a machine.
@@ -215,6 +222,7 @@ type routing struct {
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
+	StartupTime           time.Duration
 	RequestHeaderTimeout  time.Duration
 	ResponseHeaderTimeout time.Duration
 	ServerReadTimeout     time.Duration
@@ -238,9 +246,22 @@ type Machine struct {
 	IsHealthy    bool
 	LastCheck    time.Time
 	IsWaking     bool
+	wakeGen      int       // monotonically increasing generation counter for wake operations
+	wake         *wakeInfo // in-flight (or most recently completed) wake generation
 	LastActivity time.Time
 	openConns    int
 	mu           sync.RWMutex
+}
+
+// wakeInfo carries the completion state of one wake generation. The error is
+// published and the done channel is closed in the same critical section
+// (finishWake), so a waiter that observes done always reads the result of the
+// exact generation it joined - even if a new wake has already started by
+// then.
+type wakeInfo struct {
+	gen  int
+	done chan struct{}
+	err  error
 }
 
 // openConnections reports how many forwarded connections are currently open. A
@@ -1306,88 +1327,225 @@ func (p *ProxyService) healthCacheStatus(machine *Machine) (cached bool, reason 
 	return true, ""
 }
 
+// defaultWOLBurstCount is how many magic packets a burst carries when the
+// machine does not configure wol_burst_count. A single packet is easy to lose
+// to a sleeping NIC or a switch that has not refreshed its ARP entry yet, so
+// each wake cycle sends a short burst instead.
+const defaultWOLBurstCount = 3
+
+// wakeAndWait makes sure a wake is in flight for the machine, then makes the
+// caller wait for its outcome bounded by the caller's ctx. The wake itself is
+// owned by the proxy, not by any request: it runs in its own goroutine on a
+// background context (see runWake), so it keeps going even if the client that
+// triggered it - or every client - times out, disconnects, or the proxy is
+// asked to shut down. All requests (the one that started the wake and any
+// that join it) merely wait on the shared completion channel of the same wake
+// generation; a client that leaves only stops waiting, it never cancels the
+// wake.
 func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error {
+	var info *wakeInfo
 	machine.mu.Lock()
 	if machine.IsWaking {
+		info = machine.wake
 		machine.mu.Unlock()
-		p.logger.Info("Machine %s wake already in progress, joining existing wait",
-			machine.Name)
-		return p.waitForWake(ctx, machine)
-	}
-
-	machine.IsWaking = true
-	machine.mu.Unlock()
-
-	defer func() {
-		machine.mu.Lock()
-		machine.IsWaking = false
+		p.logger.Info("Machine %s wake already in progress, joining existing wait (gen=%d)",
+			machine.Name, info.gen)
+	} else {
+		machine.wakeGen++
+		machine.IsWaking = true
+		machine.LastActivity = p.clock.Now()
+		info = &wakeInfo{gen: machine.wakeGen, done: make(chan struct{})}
+		machine.wake = info
 		machine.mu.Unlock()
-	}()
 
-	err := p.wolSender.SendWOL(
-		machine.Config.MacAddress,
-		machine.Config.BroadcastIP,
-		machine.Config.WolPort,
-	)
-
-	machine.mu.Lock()
-	machine.LastActivity = p.clock.Now()
-	machine.mu.Unlock()
-
-	if err != nil {
-		return fmt.Errorf("failed to send WOL: %w", err)
+		p.logger.Info("Machine %s is down, starting wake (gen=%d)", machine.Name, info.gen)
+		go p.runWake(machine, info)
 	}
-
-	p.logger.Info("WOL packet sent to %s, waiting for server to wake",
-		machine.Name)
-
-	return p.waitForWake(ctx, machine)
+	return p.joinWake(ctx, machine, info)
 }
 
-func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
-	timeout := p.clock.After(p.config.Timeout)
-	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
-	defer healthCheckTicker.Stop()
+// runWake performs the actual wake (health check first, then WOL bursts and
+// health polling) for one generation, fully detached from any request context.
+// Clients routinely time out long before a machine can boot, so the wake must
+// outlive them: it runs on a fresh background context bounded only by the
+// (per-machine) wake timeout, and it always reaches finishWake, which releases
+// every waiter and clears IsWaking. waitForWake owns all packet sending, and
+// sends none at all if the machine turns out to be up already.
+func (p *ProxyService) runWake(machine *Machine, info *wakeInfo) {
+	p.logger.Info("WOL wake started for %s (gen=%d)", machine.Name, info.gen)
 
-	wolTicker := p.clock.NewTicker(500 * time.Millisecond)
-	defer wolTicker.Stop()
+	wakeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.finishWake(machine, info, p.waitForWake(wakeCtx, machine, info.gen))
+}
 
+// finishWake publishes the outcome of a wake generation, clears IsWaking and
+// releases every waiter in one critical section, so no new wake generation
+// can start in between the state update and the close of done: joiners that
+// wake up on done always observe the result of the generation they joined.
+func (p *ProxyService) finishWake(machine *Machine, info *wakeInfo, err error) {
+	machine.mu.Lock()
+	if machine.wakeGen == info.gen {
+		machine.IsWaking = false
+	}
+	info.err = err
+	machine.mu.Unlock()
+	close(info.done)
+}
+
+// joinWake makes a request wait for one wake generation to finish, bounded by
+// the request's ctx. A result of ctx.Err() only means "this client stopped
+// waiting"; the wake itself keeps running (runWake is detached from the
+// request), so the machine is still confirmed even if every client gave up.
+func (p *ProxyService) joinWake(ctx context.Context, machine *Machine, info *wakeInfo) error {
+	if info == nil {
+		return fmt.Errorf("no in-flight wake to join for %s", machine.Name)
+	}
+
+	select {
+	case <-info.done:
+		// finishWake published info.err in the same critical section that
+		// cleared IsWaking, before closing done: it always describes this
+		// generation, even if a new wake has already started meanwhile.
+		machine.mu.RLock()
+		healthy := machine.IsHealthy
+		machine.mu.RUnlock()
+		if healthy {
+			return nil
+		}
+		if info.err != nil {
+			return info.err
+		}
+		return fmt.Errorf("wake failed for %s", machine.Name)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForWake brings the machine up. It first runs one health check before any
+// packet is sent: a stale health cache does not mean the machine is down, and a
+// machine that is already up should not pay for a burst and a startup quiet
+// period. Only if that check fails does the polling loop start, and each cycle
+// there is strictly: send a burst of burstCount packets 500ms apart, THEN wait
+// the full waitDuration, and only THEN perform a single health check. Checking
+// health immediately after a burst is pointless - the machine hasn't had time
+// to boot - so no check happens until the full wait has elapsed.
+//
+// The first loop wait starts at startup_time (a machine that just got its WOL
+// packet cannot answer a health check yet). The interval between subsequent
+// checks is either:
+//   - adaptive (default): halved on every retry, floored at 500ms
+//     (30s, 15s, 7.5s, ...), which converges quickly once the machine is
+//     close to being up; or
+//   - fixed: the machine's wake_health_check_interval (e.g. 2s), which spots
+//     a booted machine within one interval (also floored at 500ms).
+//
+// The whole operation is bounded by the machine's wake timeout (its
+// wake_timeout, or the global timeout when the machine does not override it) -
+// deliberately independent of any client request's deadline.
+func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine, wakeGen int) error {
+	wakeTimeout := p.config.Timeout
+	if machine.Config.WakeTimeout > 0 {
+		wakeTimeout = machine.Config.WakeTimeout
+	}
+	checkInterval := machine.Config.WakeHealthCheckInterval
+
+	timeout := p.clock.After(wakeTimeout)
 	wakeStartTime := p.clock.Now()
-	p.logger.Info("Waiting for %s to wake (poll interval %v, timeout %v)",
-		machine.Name, p.config.PollInterval, p.config.Timeout)
+	waitDuration := p.config.StartupTime
+
+	burstCount := defaultWOLBurstCount
+	if machine.Config.WolBurstCount != 0 {
+		burstCount = machine.Config.WolBurstCount
+		if burstCount < 1 {
+			burstCount = 1
+		} else if burstCount > 10 {
+			burstCount = 10
+		}
+	}
+	burstInterval := 500 * time.Millisecond
+
+	// One check before anything is sent. The health cache goes stale on
+	// purpose (health_cache_duration is shorter than health_check_interval), so
+	// "no fresh proof it is up" is not "it is down". Without this, a request
+	// for an awake machine whose entry aged out fires a burst it does not need
+	// and then waits startup_time before looking - about 31s with the defaults,
+	// which is longer than most clients are willing to wait.
+	if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+		machine.mu.Lock()
+		machine.IsHealthy = true
+		machine.LastCheck = p.clock.Now()
+		machine.mu.Unlock()
+
+		p.logger.Info("Machine %s answers a health check before any WOL was sent, no wake needed (gen=%d)",
+			machine.Name, wakeGen)
+		return nil
+	}
+
+	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
+	// returns early (with the cancellation cause) if the context is
+	// cancelled or the wake times out mid-burst.
+	sendWOLBurst := func() error {
+		for i := 0; i < burstCount; i++ {
+			if err := p.wolSender.SendWOL(
+				machine.Config.MacAddress,
+				machine.Config.BroadcastIP,
+				machine.Config.WolPort,
+			); err != nil {
+				p.logger.Error("Failed to send WOL packet during burst: %v", err)
+			} else {
+				p.logger.Info("Sent WOL burst packet %d/%d to %s",
+					i+1, burstCount, machine.Name)
+			}
+			if i < burstCount-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timeout:
+					return fmt.Errorf("timeout waiting for %s to wake up after %v",
+						machine.Name, wakeTimeout)
+				case <-p.clock.After(burstInterval):
+				}
+			}
+		}
+		return nil
+	}
 
 	for {
+		if err := sendWOLBurst(); err != nil {
+			return err
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				machine.Name, p.config.Timeout)
-		case <-wolTicker.C():
-			// Send additional WOL packets while waiting
-			err := p.wolSender.SendWOL(
-				machine.Config.MacAddress,
-				machine.Config.BroadcastIP,
-				machine.Config.WolPort,
-			)
-			if err != nil {
-				p.logger.Error("Failed to send additional WOL packet: %v", err)
-				// Continue waiting even if a packet fails to send
-			} else {
-				p.logger.Info("Sent additional WOL packet to %s",
-					machine.Name)
-			}
-		case <-healthCheckTicker.C():
-			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
-				machine.mu.Lock()
-				machine.IsHealthy = true
-				machine.LastCheck = p.clock.Now()
-				machine.mu.Unlock()
+				machine.Name, wakeTimeout)
+		case <-p.clock.After(waitDuration):
+		}
 
-				wakeDuration := p.clock.Now().Sub(wakeStartTime)
-				p.logger.Info("Machine %s woke up after %v",
-					machine.Name, wakeDuration)
-				return nil
+		if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+			machine.mu.Lock()
+			machine.IsHealthy = true
+			machine.LastCheck = p.clock.Now()
+			machine.mu.Unlock()
+
+			wakeDuration := p.clock.Now().Sub(wakeStartTime)
+			p.logger.Info("Machine %s woke up after %v (gen=%d)",
+				machine.Name, wakeDuration, wakeGen)
+			return nil
+		}
+
+		if checkInterval > 0 {
+			if checkInterval < 500*time.Millisecond {
+				checkInterval = 500 * time.Millisecond
+			}
+			waitDuration = checkInterval
+		} else {
+			waitDuration = waitDuration / 2
+			if waitDuration < 500*time.Millisecond {
+				waitDuration = 500 * time.Millisecond
 			}
 		}
 	}
@@ -1623,6 +1781,25 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
+	// startup_time is the quiet period between the first WOL packet and the
+	// first health check: a machine that was just sent a magic packet cannot
+	// answer one yet. It must fit inside each machine's wake budget (its
+	// wake_timeout, or the global timeout), or the wake times out before it
+	// ever checks.
+	//
+	// Whether it was written down matters: an explicit value is held to that
+	// rule strictly, while an omitted one is derived from the budgets the
+	// config actually uses, so a config with a short timeout that never asked
+	// for a 30s quiet period still loads.
+	startupTime := 30 * time.Second
+	startupTimeExplicit := config.StartupTime != ""
+	if startupTimeExplicit {
+		startupTime, err = time.ParseDuration(config.StartupTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid startup_time: %w", err)
+		}
+	}
+
 	if config.RequestHeaderTimeout == "" {
 		config.RequestHeaderTimeout = "30s"
 	}
@@ -1701,11 +1878,42 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, err
 	}
 
+	// An omitted startup_time must not reject a config that never asked for a
+	// quiet period: take the tightest effective wake budget in use and give it
+	// half of that, which is always strictly inside the budget.
+	if !startupTimeExplicit {
+		for _, m := range model.machines {
+			budget := timeout
+			if m.Config.WakeTimeout > 0 {
+				budget = m.Config.WakeTimeout
+			}
+			if half := budget / 2; half < startupTime {
+				startupTime = half
+			}
+		}
+	}
+
+	// startup_time must fit inside each machine's effective wake budget: its
+	// own wake_timeout when set, the global timeout otherwise. Equality is
+	// rejected too - the quiet period would eat the whole budget and the wake
+	// would time out before the first check ever ran.
+	for _, m := range model.machines {
+		if m.Config.WakeTimeout > 0 {
+			if startupTime >= m.Config.WakeTimeout {
+				return nil, fmt.Errorf("startup_time (%v) must be less than wake_timeout (%v) for machine %s",
+					startupTime, m.Config.WakeTimeout, m.Name)
+			}
+		} else if startupTime >= timeout {
+			return nil, fmt.Errorf("startup_time (%v) must be less than timeout (%v)", startupTime, timeout)
+		}
+	}
+
 	return &ProxyConfig{
 		Port:                  config.Port,
 		SSLCertificate:        config.SSLCertificate,
 		SSLCertificateKey:     config.SSLCertificateKey,
 		Timeout:               timeout,
+		StartupTime:           startupTime,
 		RequestHeaderTimeout:  requestHeaderTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		ServerReadTimeout:     serverReadTimeout,
@@ -1906,6 +2114,10 @@ func validateDestination(name, destination string, isTCP bool) error {
 	return nil
 }
 
+// buildMachinesAndRoutes turns the flat [[machines]] and [[routes]] entries
+// into the live routing model: it validates each entry, derives a route's
+// health check from its destination when none is given, and rejects duplicate
+// hostnames, duplicate listen ports, unknown machines and malformed routes.
 func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock, fromLegacy bool) (routing, error) {
 	machines := make(map[string]*Machine)
 	routes := make([]*Route, 0, len(routeEntries))
@@ -1956,21 +2168,45 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			}
 		}
 
+		var wakeTimeout time.Duration
+		if entry.WakeTimeout != "" {
+			wakeTimeout, err = time.ParseDuration(entry.WakeTimeout)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid wake_timeout for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		var wakeHealthCheckInterval time.Duration
+		if entry.WakeHealthCheckInterval != "" {
+			wakeHealthCheckInterval, err = time.ParseDuration(entry.WakeHealthCheckInterval)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid wake_health_check_interval for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		if entry.WolBurstCount != 0 && (entry.WolBurstCount < 1 || entry.WolBurstCount > 10) {
+			return routing{}, fmt.Errorf("wol_burst_count for machine %s must be between 1 and 10, got %d",
+				entry.Name, entry.WolBurstCount)
+		}
+
 		machines[entry.Name] = &Machine{
 			Name: entry.Name,
 			Config: &MachineConfig{
-				MacAddress:           entry.MacAddress,
-				BroadcastIP:          entry.BroadcastIP,
-				WolPort:              entry.WolPort,
-				HealthCheck:          entry.HealthCheck,
-				SSHHost:              entry.SSHHost,
-				SSHUser:              entry.SSHUser,
-				SSHKeyPath:           entry.SSHKeyPath,
-				ShutdownCommand:      entry.ShutdownCommand,
-				ShutdownHTTPUrl:      entry.ShutdownHTTPUrl,
-				ShutdownHTTPMethod:   entry.ShutdownHTTPMethod,
-				ShutdownHTTPOKStatus: entry.ShutdownHTTPOKStatus,
-				InactivityThreshold:  inactivityThreshold,
+				MacAddress:              entry.MacAddress,
+				BroadcastIP:             entry.BroadcastIP,
+				WolPort:                 entry.WolPort,
+				WolBurstCount:           entry.WolBurstCount,
+				WakeTimeout:             wakeTimeout,
+				WakeHealthCheckInterval: wakeHealthCheckInterval,
+				HealthCheck:             entry.HealthCheck,
+				SSHHost:                 entry.SSHHost,
+				SSHUser:                 entry.SSHUser,
+				SSHKeyPath:              entry.SSHKeyPath,
+				ShutdownCommand:         entry.ShutdownCommand,
+				ShutdownHTTPUrl:         entry.ShutdownHTTPUrl,
+				ShutdownHTTPMethod:      entry.ShutdownHTTPMethod,
+				ShutdownHTTPOKStatus:    entry.ShutdownHTTPOKStatus,
+				InactivityThreshold:     inactivityThreshold,
 			},
 			LastActivity: clock.Now(),
 		}

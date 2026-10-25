@@ -1,6 +1,11 @@
 port = ":8080"                  # Port to listen on for HTTP routes
 timeout = "1m"                  # How long to wait for a machine to wake / a route to become ready. 
                                 # Cannot be disabled with "0" or a negative value - it would time out immediately.
+startup_time = "30s"            # Quiet period after the first WOL packet before the first health check.
+                                # A machine that was just woken cannot answer a check yet. Must be strictly
+                                # less than the effective wake timeout (global timeout, or a machine's
+                                # wake_timeout) - equal to it is a configuration error. Omit this key and
+                                # the default is derived from the tightest wake budget in the config.
 request_header_timeout = "30s"  # How long to wait for request headers; 
                                 # Use a negative value (e.g. "-1s") to disable it outright.
                                 # "0" alone falls back to server_read_timeout - 
@@ -36,6 +41,11 @@ name = "nas"
 mac_address = "7c:8b:ad:da:be:51"
 broadcast_ip = "10.0.0.255"
 wol_port = 9
+wol_burst_count = 3             # WOL packets per burst (1-10, default 3); set to 1 for a single packet
+
+# Optional per-machine wake behaviour (uncomment to override the defaults)
+#wake_timeout = "2m"            # How long to wait for THIS machine to boot (default: global timeout)
+#wake_health_check_interval = "2s"  # Fixed interval between health checks while waking (default: adaptive, halving from startup_time down to 500ms)
 
 # Liveness: is the box up? Must not depend on any one service on it, or a crashed
 # service would have the proxy sending magic packets at a machine that is awake.
