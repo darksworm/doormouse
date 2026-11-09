@@ -272,7 +272,10 @@ type Machine struct {
 	IsWaking     bool
 	LastActivity time.Time
 	openConns    int
-	mu           sync.RWMutex
+	// wolFailures holds the interfaces already reported as unreachable during
+	// the current wake, so a dead one is logged once and not on every resend.
+	wolFailures map[string]bool
+	mu          sync.RWMutex
 }
 
 // openConnections reports how many forwarded connections are currently open. A
@@ -1350,6 +1353,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 	}
 
 	machine.IsWaking = true
+	machine.wolFailures = nil
 	machine.mu.Unlock()
 
 	defer func() {
@@ -1383,21 +1387,49 @@ func (p *ProxyService) sendWOL(machine *Machine) error {
 		return fmt.Errorf("machine %s has no mac_address to send a WOL packet to", machine.Name)
 	}
 
-	var failures []error
+	type failure struct {
+		iface WOLInterface
+		err   error
+	}
+	var failures []failure
 	for _, iface := range interfaces {
 		err := p.wolSender.SendWOL(iface.MacAddress, iface.BroadcastIP, machine.Config.WolPort)
 		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", iface.MacAddress, err))
+			failures = append(failures, failure{iface, err})
 		}
 	}
 
 	if len(failures) == len(interfaces) {
-		return errors.Join(failures...)
+		errs := make([]error, 0, len(failures))
+		for _, f := range failures {
+			errs = append(errs, fmt.Errorf("%s: %w", f.iface.MacAddress, f.err))
+		}
+		return errors.Join(errs...)
 	}
-	for _, failure := range failures {
-		p.logger.Error("Failed to send WOL packet to one interface of %s: %v", machine.Name, failure)
+	for _, f := range failures {
+		p.reportWOLFailure(machine, f.iface, f.err)
 	}
 	return nil
+}
+
+// reportWOLFailure logs an interface that could not be sent a packet, once per
+// wake. Packets are resent every 500ms, and an interface that is unreachable now
+// will be unreachable on every one of them.
+func (p *ProxyService) reportWOLFailure(machine *Machine, iface WOLInterface, err error) {
+	machine.mu.Lock()
+	reported := machine.wolFailures[iface.MacAddress]
+	if !reported {
+		if machine.wolFailures == nil {
+			machine.wolFailures = make(map[string]bool)
+		}
+		machine.wolFailures[iface.MacAddress] = true
+	}
+	machine.mu.Unlock()
+
+	if !reported {
+		p.logger.Error("Failed to send WOL packet to interface %s of %s, carrying on with the others: %v",
+			iface.MacAddress, machine.Name, err)
+	}
 }
 
 func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
@@ -1655,10 +1687,18 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	// health check at all and no hint as to why. Refuse rather than run degraded.
 	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
 		keys := make([]string, 0, len(undecoded))
+		hint := ""
 		for _, key := range undecoded {
 			keys = append(keys, key.String())
+			// TOML gives every key below a [[machines.interfaces]] header to that
+			// interface, so a machine key written after one lands here. The bare
+			// key name alone would send the operator hunting for a typo.
+			if strings.HasPrefix(key.String(), "machines.interfaces.") {
+				hint = "; an interface takes only mac_address and broadcast_ip, and any key below a " +
+					"[[machines.interfaces]] block belongs to that interface, so keep the machine's own keys above the first one"
+			}
 		}
-		return nil, fmt.Errorf("unknown key(s) in %s: %s", filename, strings.Join(keys, ", "))
+		return nil, fmt.Errorf("unknown key(s) in %s: %s%s", filename, strings.Join(keys, ", "), hint)
 	}
 
 	// Trim whitespace and handle optional SSL certificate fields

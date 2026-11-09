@@ -893,6 +893,36 @@ destination = "http://nas.local"
 	mustContain(t, err, "health_chek")
 }
 
+func TestLoadConfig_MachineKeyBelowAnInterfaceBlockExplainsTheOrdering(t *testing.T) {
+	// TOML hands health_check to the interface above it. Reported as a bare
+	// unknown key, that reads like a typo in a key that is spelled correctly.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+
+health_check = "tcp://nas.local:22"
+`+interfacesRoute), RealClock{})
+
+	mustContain(t, err, "machines.interfaces.health_check", "above")
+}
+
+func TestLoadConfig_UnknownMachineKeyGetsNoInterfaceHint(t *testing.T) {
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_chek = "tcp://nas.local:22"
+`+interfacesRoute), RealClock{})
+
+	mustContain(t, err, "health_chek")
+	if strings.Contains(err.Error(), "interface") {
+		t.Errorf("a typo outside an interface block should not mention interfaces, got: %v", err)
+	}
+}
+
 func TestLoadConfig_MachineHealthCheckMustCarryAUsableScheme(t *testing.T) {
 	// Requiring the key to be non-empty is not enough: Check routes tcp:// to a dialer
 	// and everything else to an HTTP client, so a bare "nas.local:22" is parsed as a
@@ -3024,6 +3054,57 @@ func TestSendWOL_OneFailingInterfaceDoesNotStopTheOthers(t *testing.T) {
 	}
 	if got := tp.wol.callCount(); got != 2 {
 		t.Errorf("WOL calls = %d, want 2: the second interface must still be tried", got)
+	}
+}
+
+// unreachableInterfaceReports counts the log lines about the failing interface.
+func unreachableInterfaceReports(logger *recordingLogger) int {
+	return strings.Count(logger.all(), "AA:BB:CC:DD:EE:FF")
+}
+
+func TestSendWOL_UnreachableInterfaceIsLoggedOncePerWake(t *testing.T) {
+	// Packets are resent every 500ms for the whole timeout. An interface that is
+	// down would otherwise fill the log with the same line.
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.errFor = map[string]error{"AA:BB:CC:DD:EE:FF": fmt.Errorf("network is unreachable")}
+	logger := &recordingLogger{}
+	tp.svc.logger = logger
+
+	for i := 0; i < 3; i++ {
+		if err := tp.svc.sendWOL(tp.machine); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if got := unreachableInterfaceReports(logger); got != 1 {
+		t.Errorf("unreachable interface logged %d times over three sends, want 1:\n%s", got, logger.all())
+	}
+	if !strings.Contains(logger.all(), "network is unreachable") {
+		t.Errorf("the log should say why the interface failed, got:\n%s", logger.all())
+	}
+}
+
+func TestWakeAndWait_ReportsAnUnreachableInterfaceAgainOnTheNextWake(t *testing.T) {
+	// "Once" is per wake: a later wake is a new event, and the interface may have
+	// been fixed and broken again in between.
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.errFor = map[string]error{"AA:BB:CC:DD:EE:FF": fmt.Errorf("network is unreachable")}
+	logger := &recordingLogger{}
+	tp.svc.logger = logger
+
+	// An already-cancelled context ends each wake right after its first send.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 2; i++ {
+		if err := tp.svc.wakeAndWait(ctx, tp.machine); !errors.Is(err, context.Canceled) {
+			t.Fatalf("wake %d: expected the cancelled context, got: %v", i+1, err)
+		}
+	}
+
+	if got := unreachableInterfaceReports(logger); got != 2 {
+		t.Errorf("unreachable interface logged %d times over two wakes, want 2:\n%s", got, logger.all())
 	}
 }
 
