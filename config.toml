@@ -72,6 +72,10 @@ destination = "http://nas.local:2342"
 # tells you something is listening. Point it at a real health endpoint when the
 # service takes a while to come up after the box does.
 health_check = "http://nas.local:2342/ping"
+# By default the Host header sent upstream is the one in `destination`. Set this
+# when a reverse proxy on the machine picks the service by Host. The client's Host
+# is then passed through, and HTTP readiness checks send this route's hostname.
+# preserve_host = true
 
 # A TCP route has no Host header to match on, so it gets its own listening port.
 # This is how you put ssh, or anything else that isn't HTTP, behind the proxy.

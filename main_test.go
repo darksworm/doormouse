@@ -185,6 +185,7 @@ type mockHealthChecker struct {
 	mu         sync.Mutex
 	result     bool
 	checkCount int
+	hosts      []string // the host each check was asked to send
 }
 
 func (m *mockHealthChecker) setResult(v bool) {
@@ -199,10 +200,17 @@ func (m *mockHealthChecker) checks() int {
 	return m.checkCount
 }
 
-func (m *mockHealthChecker) Check(_ context.Context, _, _ string) bool {
+func (m *mockHealthChecker) checkedHosts() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.hosts...)
+}
+
+func (m *mockHealthChecker) Check(_ context.Context, _, host, _ string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.checkCount++
+	m.hosts = append(m.hosts, host)
 	return m.result
 }
 
@@ -1337,6 +1345,41 @@ destination = "nas.local:22"
 	if tcpRoute.HealthCheck != "tcp://nas.local:22" {
 		t.Errorf("TCP route without health_check should dial its destination, got %q", tcpRoute.HealthCheck)
 	}
+}
+
+func TestLoadConfig_PreserveHostIsOptInPerRoute(t *testing.T) {
+	cfg := machinesRoutesConfig + `
+[[routes]]
+machine = "nas"
+hostname = "photos.home.com"
+destination = "http://nas.local"
+preserve_host = true
+`
+	result, err := LoadConfig(writeTempConfig(t, cfg), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !result.RoutesByHostname["photos.home.com"].PreserveHost {
+		t.Error("route with preserve_host = true should preserve the Host header")
+	}
+	if result.RoutesByHostname["files.home.com"].PreserveHost {
+		t.Error("route without preserve_host should rewrite the Host header, as before")
+	}
+}
+
+func TestLoadConfig_PreserveHostOnTCPRouteIsRejected(t *testing.T) {
+	// A TCP route forwards raw bytes and never reads a Host header, so the
+	// setting could only mislead.
+	_, err := LoadConfig(writeTempConfig(t, machinesRoutesConfig+`
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+preserve_host = true
+`), RealClock{})
+
+	mustContain(t, err, ":2222", "preserve_host")
 }
 
 func TestLoadConfig_RouteWithUndialableDestination(t *testing.T) {
@@ -2624,7 +2667,7 @@ func TestEndpointHealthChecker_Check_Healthy(t *testing.T) {
 	defer backend.Close()
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), backend.URL+"/health", "test")
+	result := hc.Check(context.Background(), backend.URL+"/health", "", "test")
 	if !result {
 		t.Error("expected Check to return true for 200 response")
 	}
@@ -2637,15 +2680,32 @@ func TestEndpointHealthChecker_Check_Unhealthy(t *testing.T) {
 	defer backend.Close()
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), backend.URL+"/health", "test")
+	result := hc.Check(context.Background(), backend.URL+"/health", "", "test")
 	if result {
 		t.Error("expected Check to return false for 500 response")
 	}
 }
 
+func TestEndpointHealthChecker_Check_SendsTheGivenHost(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "models.home.com" {
+			w.WriteHeader(404)
+		}
+	}))
+	defer backend.Close()
+
+	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
+	if !hc.Check(context.Background(), backend.URL+"/health", "models.home.com", "test") {
+		t.Error("expected the check to reach the backend as models.home.com")
+	}
+	if hc.Check(context.Background(), backend.URL+"/health", "", "test") {
+		t.Error("an empty host should leave the URL's own host in place")
+	}
+}
+
 func TestEndpointHealthChecker_Check_ConnectionRefused(t *testing.T) {
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "test")
+	result := hc.Check(context.Background(), "http://127.0.0.1:19998/health", "", "test")
 	if result {
 		t.Error("expected Check to return false for refused connection")
 	}
@@ -2673,19 +2733,19 @@ func TestHealthChecker_Check_TCPScheme(t *testing.T) {
 
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
 
-	if !hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+	if !hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "", "test") {
 		t.Error("expected a listening socket to be reported healthy")
 	}
 
 	listener.Close()
-	if hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "test") {
+	if hc.Check(context.Background(), "tcp://"+listener.Addr().String(), "", "test") {
 		t.Error("expected a closed socket to be reported unhealthy")
 	}
 }
 
 func TestHealthChecker_Check_TCPSchemeRejectsGarbageAddress(t *testing.T) {
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	if hc.Check(context.Background(), "tcp://", "test") {
+	if hc.Check(context.Background(), "tcp://", "", "test") {
 		t.Error("expected an empty tcp address to be unhealthy")
 	}
 }
@@ -3131,6 +3191,84 @@ func TestHandleRequest_HealthyTarget(t *testing.T) {
 	}
 }
 
+// hostSeenByBackend sends one request for testHostname through the proxy and
+// returns the Host header the backend received.
+func hostSeenByBackend(t *testing.T, preserveHost bool) (seen, destination string) {
+	t.Helper()
+	hosts := make(chan string, 1)
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hosts <- r.Host
+	}))
+	tp.route.PreserveHost = preserveHost
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	proxy := httptest.NewServer(http.HandlerFunc(tp.svc.handleRequest))
+	defer proxy.Close()
+
+	resp := doRequest(t, proxy.URL)
+	resp.Body.Close()
+
+	return <-hosts, strings.TrimPrefix(tp.backend.URL, "http://")
+}
+
+func TestHandleRequest_RewritesHostToTheDestinationByDefault(t *testing.T) {
+	seen, destination := hostSeenByBackend(t, false)
+	if seen != destination {
+		t.Errorf("backend saw Host %q, want the destination's %q", seen, destination)
+	}
+}
+
+func TestHandleRequest_PreserveHostForwardsTheClientsHost(t *testing.T) {
+	seen, _ := hostSeenByBackend(t, true)
+	if seen != testHostname {
+		t.Errorf("backend saw Host %q, want the client's %q", seen, testHostname)
+	}
+}
+
+// readinessHostsSent sends one request to a route that is not yet ready and
+// returns the Host each readiness check was asked to send.
+func readinessHostsSent(t *testing.T, preserveHost bool) []string {
+	t.Helper()
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	tp.route.PreserveHost = preserveHost
+
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	tp.route.mu.Lock()
+	tp.route.IsReady = false
+	tp.route.mu.Unlock()
+
+	tp.health.setResult(true)
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = testHostname
+	tp.svc.handleRequest(httptest.NewRecorder(), r)
+
+	return tp.health.checkedHosts()
+}
+
+func TestHandleRequest_ReadinessCheckUsesItsURLsHostByDefault(t *testing.T) {
+	hosts := readinessHostsSent(t, false)
+	if len(hosts) != 1 || hosts[0] != "" {
+		t.Errorf("readiness checks sent hosts %q, want one check with no override", hosts)
+	}
+}
+
+func TestHandleRequest_PreserveHostReadinessCheckSendsTheRouteHostname(t *testing.T) {
+	// The proxy behind doormouse picks the backend by Host, so a readiness check
+	// without it would test whatever its default site is.
+	hosts := readinessHostsSent(t, true)
+	if len(hosts) != 1 || hosts[0] != testHostname {
+		t.Errorf("readiness checks sent hosts %q, want one check as %q", hosts, testHostname)
+	}
+}
+
 func TestHandleRequest_ExpiredReadinessCache_ServesWithoutWaitingForAPollTick(t *testing.T) {
 	// Background checks refresh readiness every health_check_interval but the cache
 	// only lasts health_cache_duration, so there is a window where readiness is stale
@@ -3514,7 +3652,7 @@ func TestEndpointHealthChecker_Check_Status300(t *testing.T) {
 	}))
 	defer backend.Close()
 	hc := NewEndpointHealthChecker(noopLogger{}, RealClock{})
-	if hc.Check(context.Background(), backend.URL+"/health", "test") {
+	if hc.Check(context.Background(), backend.URL+"/health", "", "test") {
 		t.Error("expected Check to return false for status 300 (>= 300 is unhealthy)")
 	}
 }
@@ -3814,5 +3952,37 @@ func TestBackgroundCheck_PeriodicTick_DowngradesToUnhealthy(t *testing.T) {
 	defer machine.mu.RUnlock()
 	if !machine.LastCheck.Equal(clock.Now()) {
 		t.Errorf("expected LastCheck advanced to %v, got %v", clock.Now(), machine.LastCheck)
+	}
+}
+
+func TestBackgroundChecks_PreserveHostRouteIsCheckedAsItsHostname(t *testing.T) {
+	machineUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer machineUp.Close()
+
+	// Stands in for a reverse proxy that only knows the route by name.
+	frontProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != testHostname {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer frontProxy.Close()
+
+	hc := NewEndpointHealthChecker(noopLogger{}, newManualClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)))
+	machine := &Machine{Name: testMachineName, Config: &MachineConfig{HealthCheck: machineUp.URL}}
+	route := &Route{Name: testHostname, Machine: machine, Hostname: testHostname,
+		Destination: frontProxy.URL, HealthCheck: frontProxy.URL, PreserveHost: true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hc.StartBackgroundChecks(ctx, map[string]*Machine{testMachineName: machine}, []*Route{route}, time.Minute)
+	if err := hc.WaitForInitialChecks(ctx); err != nil {
+		t.Fatalf("initial checks did not complete: %v", err)
+	}
+
+	route.mu.RLock()
+	ready := route.IsReady
+	route.mu.RUnlock()
+	if !ready {
+		t.Error("route should be ready: its check reaches the front proxy as its own hostname")
 	}
 }

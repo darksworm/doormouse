@@ -26,7 +26,9 @@ import (
 
 // Interfaces for dependency injection
 type HealthChecker interface {
-	Check(ctx context.Context, endpoint string, source string) bool
+	// Check probes endpoint. A non-empty host replaces the Host header of an
+	// HTTP check; TCP checks ignore it.
+	Check(ctx context.Context, endpoint, host, source string) bool
 	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 	CloseIdleConnections()
@@ -141,11 +143,12 @@ type MachineEntry struct {
 
 // RouteEntry is a [[routes]] block as written in the config file.
 type RouteEntry struct {
-	Machine     string `toml:"machine"`
-	Hostname    string `toml:"hostname,omitempty"`
-	ListenPort  int    `toml:"listen_port,omitempty"`
-	Destination string `toml:"destination,omitempty"`
-	HealthCheck string `toml:"health_check,omitempty"`
+	Machine      string `toml:"machine"`
+	Hostname     string `toml:"hostname,omitempty"`
+	ListenPort   int    `toml:"listen_port,omitempty"`
+	Destination  string `toml:"destination,omitempty"`
+	HealthCheck  string `toml:"health_check,omitempty"`
+	PreserveHost bool   `toml:"preserve_host,omitempty"`
 }
 
 type Target struct {
@@ -194,6 +197,9 @@ type Route struct {
 	// distinct from the machine's liveness check, which answers whether the box is
 	// up at all. Defaults to dialing Destination.
 	HealthCheck string
+	// PreserveHost forwards the client's Host header instead of the
+	// destination's, so a reverse proxy behind doormouse can route on it.
+	PreserveHost bool
 
 	IsReady   bool
 	LastCheck time.Time
@@ -203,6 +209,16 @@ type Route struct {
 // IsTCP reports whether this route is reached by its own listening socket rather
 // than by Host header. A route has a hostname or a listen port, never both.
 func (r *Route) IsTCP() bool { return r.ListenPort != 0 }
+
+// healthCheckHost is the Host header this route's readiness check sends. With
+// preserve_host the proxy behind doormouse routes on Host, so the check has to
+// ask for this route by name; otherwise the URL's own host is right.
+func (r *Route) healthCheckHost() string {
+	if r.PreserveHost {
+		return r.Hostname
+	}
+	return ""
+}
 
 // routing is the runtime routing model: machines and the routes that reach them.
 type routing struct {
@@ -305,11 +321,11 @@ func (h *EndpointHealthChecker) CloseIdleConnections() {
 	}
 }
 
-func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint, host, source string) bool {
 	if address, ok := strings.CutPrefix(endpoint, tcpScheme); ok {
 		return h.checkTCP(ctx, address, source)
 	}
-	return h.checkHTTP(ctx, endpoint, source)
+	return h.checkHTTP(ctx, endpoint, host, source)
 }
 
 // checkTCP reports liveness by opening and immediately closing a connection. For
@@ -325,12 +341,14 @@ func (h *EndpointHealthChecker) checkTCP(ctx context.Context, address string, so
 	return true
 }
 
-func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint, host, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
+	// Empty leaves the URL's own host, which is what net/http sends by default.
+	req.Host = host
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -401,7 +419,7 @@ func (h *EndpointHealthChecker) performCheck(ctx context.Context, name string, m
 	checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
-	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background")
+	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "", "background")
 
 	machine.mu.Lock()
 	previousHealth := machine.IsHealthy
@@ -444,7 +462,7 @@ func (h *EndpointHealthChecker) checkRoutes(ctx context.Context, machine *Machin
 		}
 
 		checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
-		ready := h.Check(checkCtx, route.HealthCheck, "background")
+		ready := h.Check(checkCtx, route.HealthCheck, route.healthCheckHost(), "background")
 		cancel()
 
 		route.mu.Lock()
@@ -1260,7 +1278,7 @@ func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
 }
 
 func (p *ProxyService) markReadyIfHealthy(ctx context.Context, route *Route) bool {
-	if !p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
+	if !p.healthChecker.Check(ctx, route.HealthCheck, route.healthCheckHost(), "readiness") {
 		return false
 	}
 
@@ -1378,7 +1396,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 					machine.Name)
 			}
 		case <-healthCheckTicker.C():
-			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+			if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "", "wake") {
 				machine.mu.Lock()
 				machine.IsHealthy = true
 				machine.LastCheck = p.clock.Now()
@@ -1554,8 +1572,11 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		// Set the Host header to the target's hostname from the URL
-		req.Host = targetURL.Host
+		// Set the Host header to the target's hostname from the URL, unless the
+		// route wants the client's Host passed through to a proxy behind us
+		if !route.PreserveHost {
+			req.Host = targetURL.Host
+		}
 
 		// Log request details including content length for debugging
 		contentLength := req.ContentLength
@@ -1987,6 +2008,8 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			return routing{}, fmt.Errorf("route for machine %q needs either a hostname or a listen_port", entry.Machine)
 		case entry.Hostname != "" && entry.ListenPort != 0:
 			return routing{}, fmt.Errorf("route %s sets both hostname and listen_port; a route is reached one way or the other", name)
+		case entry.ListenPort != 0 && entry.PreserveHost:
+			return routing{}, fmt.Errorf("route %s sets preserve_host, but a listen_port route forwards raw TCP and has no Host header", name)
 		}
 
 		if existing, exists := routesByHostname[entry.Hostname]; exists {
@@ -2023,12 +2046,13 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 		}
 
 		route := &Route{
-			Name:        name,
-			Machine:     machine,
-			Hostname:    entry.Hostname,
-			ListenPort:  entry.ListenPort,
-			Destination: entry.Destination,
-			HealthCheck: healthCheck,
+			Name:         name,
+			Machine:      machine,
+			Hostname:     entry.Hostname,
+			ListenPort:   entry.ListenPort,
+			Destination:  entry.Destination,
+			HealthCheck:  healthCheck,
+			PreserveHost: entry.PreserveHost,
 		}
 		routes = append(routes, route)
 		if route.IsTCP() {
