@@ -71,6 +71,28 @@ func TestContainerImage(t *testing.T) {
 		}
 	})
 
+	t.Run("two_interfaces", func(t *testing.T) {
+		t.Parallel()
+		env := suite.machineOn(t, twoInterfaceConfig, 1000, 1000, "backend", "backend-wifi")
+		proxy := startContainer(t, suite.image, env.proxyOptions(false, 1000)...)
+		if state := env.state(t); state.Awake || len(state.Packets) != 0 {
+			t.Fatalf("backend should initially be asleep and unsignalled: %+v", state)
+		}
+
+		// Only the second interface can wake the backend, so a response at all
+		// means the proxy did not stop at the first one.
+		assertHTTP(t, proxy)
+
+		// Each interface must be signalled on its own network: the first on the
+		// machine's broadcast_ip, the second on the one it sets itself.
+		dead := deadInterfaceMAC + "@" + env.backendIP(t, "backend")
+		waking := wakingInterfaceMAC + "@" + env.backendIP(t, "backend-wifi")
+		state := env.state(t)
+		if state.Packets[dead] == 0 || state.Packets[waking] == 0 || len(state.Packets) != 2 {
+			t.Fatalf("want magic packets at exactly %s and %s, got %v", dead, waking, state.Packets)
+		}
+	})
+
 	t.Run("migration", func(t *testing.T) {
 		for _, readOnly := range []bool{false, true} {
 			name := "writable_directory"
