@@ -388,6 +388,46 @@ nginx follows the backend's `Cache-Control` and `Expires` headers over
 proxy that can serve stale content while it refreshes, such as Varnish, works
 the same way.
 
+### A proxy behind doormouse
+
+The machine you wake may run its own reverse proxy. It picks a service by the
+`Host` header, and listens on one port for all of them:
+
+```text
+client -> front proxy -> doormouse -> proxy on the machine -> service
+```
+
+By default doormouse sets `Host` to the host in `destination`. Here that is the
+machine's address, so the proxy on the machine cannot tell which service you
+want. Set `preserve_host` on the route to pass the client's `Host` through
+instead:
+
+```toml
+[[routes]]
+machine = "server"
+hostname = "models.home.com"
+destination = "http://192.168.1.230"
+preserve_host = true
+```
+
+Now `destination` needs no service port. The proxy on the machine handles that.
+
+The route's readiness check sends the same `Host`, so it reaches the right
+service too. The default check only dials port 80. That passes as soon as the
+proxy on the machine is up, even if the service behind it is still starting. Give
+the route an HTTP `health_check` to wait for the service itself:
+
+```toml
+health_check = "http://192.168.1.230/health"
+```
+
+`preserve_host` works on HTTP routes only. A TCP route has no `Host` header.
+
+> [!NOTE]
+> `preserve_host` changes the `Host` header only. With an `https://`
+> destination or health check, the TLS name still comes from the URL. So the
+> proxy on the machine must accept that name, or use plain `http://` on the LAN.
+
 ## Config validation
 
 doormouse validates the config at startup and refuses to run on a bad one, rather
@@ -399,6 +439,7 @@ than starting and misbehaving later. It rejects:
   need an absolute `http://` or `https://` URL. A schemeless value such as
   `nas.local:2283` parses as a URL scheme named `nas.local` and would otherwise
   502 every request with nothing in the logs.
+- **`preserve_host` on a TCP route.** Raw TCP has no `Host` header to keep.
 - **A `health_check` the checker cannot dispatch on.** It must start with
   `tcp://`, `http://` or `https://`.
 - **Any unrecognised key.** Typos used to decode silently to a zero value, which
