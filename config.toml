@@ -58,6 +58,17 @@ shutdown_command = "sudo systemctl suspend"
 #shutdown_http_method = "POST"     # Optional; defaults to POST
 #shutdown_http_ok_status = 202     # Optional; omit to accept any 2xx
 
+# A machine that can be woken through several interfaces lists them in place of
+# mac_address. Every wake sends a magic packet to each one. An interface uses the
+# machine's broadcast_ip unless it sets its own. Keep these blocks below the
+# machine's other keys: TOML reads any key after them as part of the interface.
+#[[machines.interfaces]]
+#mac_address = "7c:8b:ad:da:be:51"
+#
+#[[machines.interfaces]]
+#mac_address = "7c:8b:ad:da:be:52"
+#broadcast_ip = "10.0.20.255"
+
 # An HTTP route is matched on the Host header, so many of them can share port 8080.
 [[routes]]
 machine = "nas"

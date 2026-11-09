@@ -174,6 +174,43 @@ client unmodified, so there is no man-in-the-middle and no key substitution.
 > that was previously reachable only from your LAN now depends on where you run
 > the proxy. Bind it somewhere you trust.
 
+### Machines with several interfaces
+
+Some machines can be woken through more than one network interface: two wired
+ports, or a wired port plus Wi-Fi. doormouse cannot tell which one will work
+right now, so list them all. Every wake sends a magic packet to each interface.
+
+```toml
+[[machines]]
+name = "nas"
+broadcast_ip = "10.0.0.255"
+health_check = "tcp://nas.local:22"
+
+[[machines.interfaces]]
+mac_address = "7c:8b:ad:da:be:51"
+
+# Wi-Fi, on another subnet.
+[[machines.interfaces]]
+mac_address = "7c:8b:ad:da:be:52"
+broadcast_ip = "10.0.20.255"
+```
+
+An interface uses the machine's `broadcast_ip` unless it sets its own. Use
+`[[machines.interfaces]]` in place of the machine's `mac_address`, not next to
+it. A machine with one interface can keep the plain `mac_address` form.
+
+Put the `[[machines.interfaces]]` blocks below the machine's other keys. TOML
+reads any key that follows one as part of that interface.
+
+The wake carries on as long as one packet goes out. An interface that cannot be
+reached is logged and skipped.
+
+> [!NOTE]
+> A second `broadcast_ip` only helps if the doormouse host can reach that
+> subnet. Magic packets do not route, so it needs an interface there too.
+> Waking over Wi-Fi also depends on the card. Many only wake from suspend, not
+> from poweroff. Test yours before you depend on it.
+
 ## Names and DNS
 
 doormouse deals with two kinds of name, resolved in two different places.
@@ -442,6 +479,10 @@ than starting and misbehaving later. It rejects:
 - **`preserve_host` on a TCP route.** Raw TCP has no `Host` header to keep.
 - **A `health_check` the checker cannot dispatch on.** It must start with
   `tcp://`, `http://` or `https://`.
+- **A `mac_address` that is not a MAC address.** The typo would otherwise show
+  up only when the machine fails to wake.
+- **A machine with both `mac_address` and `[[machines.interfaces]]`**, or an
+  interface with no `mac_address` or no `broadcast_ip` to use.
 - **Any unrecognised key.** Typos used to decode silently to a zero value, which
   is the usual route to a missing health check.
 
