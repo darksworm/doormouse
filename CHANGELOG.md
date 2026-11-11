@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.2.0](https://github.com/darksworm/doormouse/compare/v2.1.0...v2.2.0) (2026-11-11)
+
+
+### Features
+
+* a machine can now be woken through several network interfaces ([#47](https://github.com/darksworm/doormouse/issues/47)) ([dcb73af](https://github.com/darksworm/doormouse/commit/dcb73af4ec0ea6b201267e92d0e7f28ce3c4afde))
+* log client hostnames via cached reverse DNS lookups ([#39](https://github.com/darksworm/doormouse/issues/39)) ([884ab50](https://github.com/darksworm/doormouse/commit/884ab50d6679c969c0ea6127f4ae2aea8000d9a2))
+* routes can now set `preserve_host = true` to forward the client's original Host header ([#46](https://github.com/darksworm/doormouse/issues/46)) ([25c335c](https://github.com/darksworm/doormouse/commit/25c335cf2ad6d26e0b1aa859255fefd8020e9e1e)), closes [#44](https://github.com/darksworm/doormouse/issues/44)
+
 ## [2.1.0](https://github.com/darksworm/doormouse/compare/v2.0.0...v2.1.0) (2026-09-24)
 
 
