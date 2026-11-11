@@ -126,19 +126,27 @@ type Config struct {
 
 // MachineEntry is a [[machines]] block as written in the config file.
 type MachineEntry struct {
-	Name                 string `toml:"name"`
-	MacAddress           string `toml:"mac_address,omitempty"`
-	BroadcastIP          string `toml:"broadcast_ip,omitempty"`
-	WolPort              int    `toml:"wol_port,omitempty"`
-	HealthCheck          string `toml:"health_check,omitempty"`
-	SSHHost              string `toml:"ssh_host,omitempty"`
-	SSHUser              string `toml:"ssh_user,omitempty"`
-	SSHKeyPath           string `toml:"ssh_key_path,omitempty"`
-	ShutdownCommand      string `toml:"shutdown_command,omitempty"`
-	ShutdownHTTPUrl      string `toml:"shutdown_http_url,omitempty"`
-	ShutdownHTTPMethod   string `toml:"shutdown_http_method,omitempty"`
-	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status,omitempty"`
-	InactivityThreshold  string `toml:"inactivity_threshold,omitempty"`
+	Name                 string           `toml:"name"`
+	MacAddress           string           `toml:"mac_address,omitempty"`
+	BroadcastIP          string           `toml:"broadcast_ip,omitempty"`
+	WolPort              int              `toml:"wol_port,omitempty"`
+	Interfaces           []InterfaceEntry `toml:"interfaces,omitempty"`
+	HealthCheck          string           `toml:"health_check,omitempty"`
+	SSHHost              string           `toml:"ssh_host,omitempty"`
+	SSHUser              string           `toml:"ssh_user,omitempty"`
+	SSHKeyPath           string           `toml:"ssh_key_path,omitempty"`
+	ShutdownCommand      string           `toml:"shutdown_command,omitempty"`
+	ShutdownHTTPUrl      string           `toml:"shutdown_http_url,omitempty"`
+	ShutdownHTTPMethod   string           `toml:"shutdown_http_method,omitempty"`
+	ShutdownHTTPOKStatus int              `toml:"shutdown_http_ok_status,omitempty"`
+	InactivityThreshold  string           `toml:"inactivity_threshold,omitempty"`
+}
+
+// InterfaceEntry is a [[machines.interfaces]] block as written in the config
+// file: one network interface that can wake the machine.
+type InterfaceEntry struct {
+	MacAddress  string `toml:"mac_address"`
+	BroadcastIP string `toml:"broadcast_ip,omitempty"`
 }
 
 // RouteEntry is a [[routes]] block as written in the config file.
@@ -172,8 +180,9 @@ type Target struct {
 // Machine is a host that is woken, health-checked and shut down as one unit,
 // however many routes point at it.
 type MachineConfig struct {
-	MacAddress           string
-	BroadcastIP          string
+	// Interfaces are the network interfaces a magic packet is sent to. Any one of
+	// them may be the one that can wake the box, so every wake tries them all.
+	Interfaces           []WOLInterface
 	WolPort              int
 	HealthCheck          string
 	SSHHost              string
@@ -184,6 +193,13 @@ type MachineConfig struct {
 	ShutdownHTTPMethod   string
 	ShutdownHTTPOKStatus int
 	InactivityThreshold  time.Duration
+}
+
+// WOLInterface is one network interface of a machine and the broadcast address
+// that reaches it.
+type WOLInterface struct {
+	MacAddress  string
+	BroadcastIP string
 }
 
 // Route is one way in to a machine.
@@ -256,7 +272,10 @@ type Machine struct {
 	IsWaking     bool
 	LastActivity time.Time
 	openConns    int
-	mu           sync.RWMutex
+	// wolFailures holds the interfaces already reported as unreachable during
+	// the current wake, so a dead one is logged once and not on every resend.
+	wolFailures map[string]bool
+	mu          sync.RWMutex
 }
 
 // openConnections reports how many forwarded connections are currently open. A
@@ -1334,6 +1353,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 	}
 
 	machine.IsWaking = true
+	machine.wolFailures = nil
 	machine.mu.Unlock()
 
 	defer func() {
@@ -1342,11 +1362,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 		machine.mu.Unlock()
 	}()
 
-	err := p.wolSender.SendWOL(
-		machine.Config.MacAddress,
-		machine.Config.BroadcastIP,
-		machine.Config.WolPort,
-	)
+	err := p.sendWOL(machine)
 
 	machine.mu.Lock()
 	machine.LastActivity = p.clock.Now()
@@ -1360,6 +1376,60 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 		machine.Name)
 
 	return p.waitForWake(ctx, machine)
+}
+
+// sendWOL sends a magic packet to every interface of the machine. The proxy
+// cannot know which interface is able to wake the box, so one that fails must
+// not stop the others: it is an error only when no packet went out at all.
+func (p *ProxyService) sendWOL(machine *Machine) error {
+	interfaces := machine.Config.Interfaces
+	if len(interfaces) == 0 {
+		return fmt.Errorf("machine %s has no mac_address to send a WOL packet to", machine.Name)
+	}
+
+	type failure struct {
+		iface WOLInterface
+		err   error
+	}
+	var failures []failure
+	for _, iface := range interfaces {
+		err := p.wolSender.SendWOL(iface.MacAddress, iface.BroadcastIP, machine.Config.WolPort)
+		if err != nil {
+			failures = append(failures, failure{iface, err})
+		}
+	}
+
+	if len(failures) == len(interfaces) {
+		errs := make([]error, 0, len(failures))
+		for _, f := range failures {
+			errs = append(errs, fmt.Errorf("%s: %w", f.iface.MacAddress, f.err))
+		}
+		return errors.Join(errs...)
+	}
+	for _, f := range failures {
+		p.reportWOLFailure(machine, f.iface, f.err)
+	}
+	return nil
+}
+
+// reportWOLFailure logs an interface that could not be sent a packet, once per
+// wake. Packets are resent every 500ms, and an interface that is unreachable now
+// will be unreachable on every one of them.
+func (p *ProxyService) reportWOLFailure(machine *Machine, iface WOLInterface, err error) {
+	machine.mu.Lock()
+	reported := machine.wolFailures[iface.MacAddress]
+	if !reported {
+		if machine.wolFailures == nil {
+			machine.wolFailures = make(map[string]bool)
+		}
+		machine.wolFailures[iface.MacAddress] = true
+	}
+	machine.mu.Unlock()
+
+	if !reported {
+		p.logger.Error("Failed to send WOL packet to interface %s of %s, carrying on with the others: %v",
+			iface.MacAddress, machine.Name, err)
+	}
 }
 
 func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
@@ -1383,11 +1453,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 				machine.Name, p.config.Timeout)
 		case <-wolTicker.C():
 			// Send additional WOL packets while waiting
-			err := p.wolSender.SendWOL(
-				machine.Config.MacAddress,
-				machine.Config.BroadcastIP,
-				machine.Config.WolPort,
-			)
+			err := p.sendWOL(machine)
 			if err != nil {
 				p.logger.Error("Failed to send additional WOL packet: %v", err)
 				// Continue waiting even if a packet fails to send
@@ -1621,10 +1687,18 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	// health check at all and no hint as to why. Refuse rather than run degraded.
 	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
 		keys := make([]string, 0, len(undecoded))
+		hint := ""
 		for _, key := range undecoded {
 			keys = append(keys, key.String())
+			// TOML gives every key below a [[machines.interfaces]] header to that
+			// interface, so a machine key written after one lands here. The bare
+			// key name alone would send the operator hunting for a typo.
+			if strings.HasPrefix(key.String(), "machines.interfaces.") {
+				hint = "; an interface takes only mac_address and broadcast_ip, and any key below a " +
+					"[[machines.interfaces]] block belongs to that interface, so keep the machine's own keys above the first one"
+			}
 		}
-		return nil, fmt.Errorf("unknown key(s) in %s: %s", filename, strings.Join(keys, ", "))
+		return nil, fmt.Errorf("unknown key(s) in %s: %s%s", filename, strings.Join(keys, ", "), hint)
 	}
 
 	// Trim whitespace and handle optional SSL certificate fields
@@ -1829,6 +1903,59 @@ func dropUnsetIntKeys(encoded string) string {
 	return strings.Join(kept, "\n")
 }
 
+// buildWOLInterfaces resolves the interfaces a machine is woken through. A machine
+// names them one of two ways: a single top-level mac_address, or a list of
+// [[machines.interfaces]] blocks. Both end up as the same list, so the wake path
+// never has to tell them apart.
+func buildWOLInterfaces(entry MachineEntry) ([]WOLInterface, error) {
+	if len(entry.Interfaces) == 0 {
+		if entry.MacAddress == "" {
+			return nil, nil
+		}
+		if _, err := net.ParseMAC(entry.MacAddress); err != nil {
+			return nil, fmt.Errorf("machine %s: invalid mac_address %q", entry.Name, entry.MacAddress)
+		}
+		return []WOLInterface{{MacAddress: entry.MacAddress, BroadcastIP: entry.BroadcastIP}}, nil
+	}
+
+	if entry.MacAddress != "" {
+		return nil, fmt.Errorf(
+			"machine %s sets both mac_address and [[machines.interfaces]]; move the mac_address into an interfaces block",
+			entry.Name)
+	}
+
+	interfaces := make([]WOLInterface, 0, len(entry.Interfaces))
+	seen := make(map[string]bool, len(entry.Interfaces))
+	for i, iface := range entry.Interfaces {
+		if iface.MacAddress == "" {
+			return nil, fmt.Errorf("machine %s: interface %d needs a mac_address", entry.Name, i+1)
+		}
+		mac, err := net.ParseMAC(iface.MacAddress)
+		if err != nil {
+			return nil, fmt.Errorf("machine %s: interface %d has an invalid mac_address %q", entry.Name, i+1, iface.MacAddress)
+		}
+		if seen[mac.String()] {
+			return nil, fmt.Errorf("machine %s lists the interface %s twice", entry.Name, iface.MacAddress)
+		}
+		seen[mac.String()] = true
+
+		// The machine's broadcast_ip is the default, so interfaces on the same
+		// subnet need not repeat it.
+		broadcastIP := iface.BroadcastIP
+		if broadcastIP == "" {
+			broadcastIP = entry.BroadcastIP
+		}
+		if broadcastIP == "" {
+			return nil, fmt.Errorf(
+				"machine %s: interface %s needs a broadcast_ip, either its own or the machine's",
+				entry.Name, iface.MacAddress)
+		}
+
+		interfaces = append(interfaces, WOLInterface{MacAddress: iface.MacAddress, BroadcastIP: broadcastIP})
+	}
+	return interfaces, nil
+}
+
 // migrateLegacyTargets translates [[targets]] blocks into the machines + routes
 // form. Each legacy target was a machine and a route rolled into one, so it
 // becomes exactly one of each.
@@ -1977,11 +2104,15 @@ func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteE
 			}
 		}
 
+		interfaces, err := buildWOLInterfaces(entry)
+		if err != nil {
+			return routing{}, err
+		}
+
 		machines[entry.Name] = &Machine{
 			Name: entry.Name,
 			Config: &MachineConfig{
-				MacAddress:           entry.MacAddress,
-				BroadcastIP:          entry.BroadcastIP,
+				Interfaces:           interfaces,
 				WolPort:              entry.WolPort,
 				HealthCheck:          entry.HealthCheck,
 				SSHHost:              entry.SSHHost,

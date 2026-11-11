@@ -11,11 +11,12 @@ Testcontainers to manage isolated containers and networks. No prebuilt applicati
 image, shell script, privileged host ports, or root test runner is required.
 Test dependencies live in this module; ordinary `go test ./...` stays Docker-free.
 
-Five proxy runs cover three scenarios:
+Six proxy runs cover four scenarios:
 
 | Scenario | Cases | What a failure catches |
 | --- | --- | --- |
 | Runtime lifecycle | Default UID 1000; overridden UID 1001 with only `NET_BIND_SERVICE` | Wrong runtime user/account, broken HTTP or raw TCP forwarding on ports 443/993, missing WOL packets, unreadable `0600` keys, failed authenticated SSH shutdown, unclean SIGTERM exit |
+| Two interfaces | Backend with an interface on each of two networks; only the second can wake it | Wake stops at the first interface, an interface is never signalled, or a packet goes to the wrong network because an interface's own `broadcast_ip` is ignored |
 | Legacy migration | Writable config directory; read-only config file with a key owned by another UID | Wrong migration location/ownership/mode, modified original config, incomplete log fallback, missing startup warning, proxy failing to serve the legacy config |
 | Capability boundary | Drop all capabilities | Executable starts without its required file capability, or fails for an unrelated reason |
 
@@ -27,9 +28,10 @@ monitor interval; tests do not change production timing or call application
 internals. Container logs are attached to failed tests and resources are cleaned
 up by Testcontainers and Go test cleanup hooks.
 
-The Go backend fixture implements real HTTP, TCP, UDP and SSH sockets. It accepts
-only the expected magic packet and the test's public key, and records an SSH
-`suspend` request as a transition to asleep. This verifies the application's
+The Go backend fixture implements real HTTP, TCP, UDP and SSH sockets. It wakes
+only on the magic packet for its own MAC, and counts every well-formed magic
+packet by MAC and by the address it arrived on. It accepts only the test's
+public key, and records an SSH `suspend` request as a transition to asleep. This verifies the application's
 network behavior; physical NIC wake support and LAN broadcast delivery remain
 deployment checks.
 

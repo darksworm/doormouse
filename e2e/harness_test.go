@@ -91,20 +91,36 @@ func compileGo(t *testing.T, dir, pkg, output string) {
 }
 
 type machine struct {
-	dir, network string
-	backend      tc.Container
+	dir     string
+	backend tc.Container
+	// networks maps each name the backend answers to onto the network that
+	// carries it. A backend with several names has an interface on each network.
+	networks map[string]string
 }
 
 func (s suite) machine(t *testing.T, config string, configUID, keyUID int) machine {
+	t.Helper()
+	return s.machineOn(t, config, configUID, keyUID, "backend")
+}
+
+// machineOn starts a backend with one network per alias, so each alias resolves
+// to a different interface of the same machine.
+func (s suite) machineOn(t *testing.T, config string, configUID, keyUID int, aliases ...string) machine {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "ssh_key"), s.privateKey, 0o600))
-	net, err := network.New(ctx)
-	must(t, err)
-	tc.CleanupNetwork(t, net)
-	backend := startContainer(t, s.image,
+	networks := make(map[string]string, len(aliases))
+	var attach []tc.ContainerCustomizer
+	for _, alias := range aliases {
+		net, err := network.New(ctx)
+		must(t, err)
+		tc.CleanupNetwork(t, net)
+		networks[alias] = net.Name
+		attach = append(attach, network.WithNetwork([]string{alias}, net))
+	}
+	backend := startContainer(t, s.image, append(attach,
 		tc.WithEntrypoint("/backend"), tc.WithCmd(),
 		tc.WithConfigModifier(func(c *container.Config) { c.User = "0:0" }),
 		tc.WithFiles(tc.ContainerFile{HostFilePath: s.backend, ContainerFilePath: "/backend", FileMode: 0o755}),
@@ -114,21 +130,32 @@ func (s suite) machine(t *testing.T, config string, configUID, keyUID int) machi
 		tc.WithHostConfigModifier(func(h *container.HostConfig) {
 			h.Mounts = []mount.Mount{{Type: mount.TypeBind, Source: dir, Target: "/fixtures"}}
 		}),
-		network.WithNetwork([]string{"backend"}, net),
 		tc.WithExposedPorts("18080/tcp"),
 		tc.WithWaitStrategy(wait.ForHTTP("/state").WithPort("18080/tcp")),
-	)
+	)...)
 	// Restore ownership before Testcontainers removes the backend and before
 	// TempDir cleanup runs. The host runner can have any UID, including 1001
 	// on GitHub Actions. No sudo or host-wide permission changes are needed.
 	t.Cleanup(func() {
 		execIn(t, backend, "chown", "-R", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "/fixtures")
 	})
-	return machine{dir: dir, network: net.Name, backend: backend}
+	return machine{dir: dir, networks: networks, backend: backend}
+}
+
+// backendIP is the backend's address on the network that carries alias.
+func (m machine) backendIP(t *testing.T, alias string) string {
+	t.Helper()
+	inspect, err := m.backend.Inspect(context.Background())
+	must(t, err)
+	endpoint := inspect.NetworkSettings.Networks[m.networks[alias]]
+	if endpoint == nil || endpoint.IPAddress == "" {
+		t.Fatalf("backend has no address for %q: %+v", alias, inspect.NetworkSettings.Networks)
+	}
+	return endpoint.IPAddress
 }
 
 func (m machine) proxyOptions(readOnly bool, uid int) []tc.ContainerCustomizer {
-	return []tc.ContainerCustomizer{
+	options := []tc.ContainerCustomizer{
 		tc.WithConfigModifier(func(c *container.Config) {
 			if uid != 1000 {
 				c.User = fmt.Sprintf("%d:%d", uid, uid)
@@ -150,10 +177,13 @@ func (m machine) proxyOptions(readOnly bool, uid int) []tc.ContainerCustomizer {
 				h.CapAdd = []string{"NET_BIND_SERVICE"}
 			}
 		}),
-		network.WithNetworkName(nil, m.network),
 		tc.WithExposedPorts("443/tcp", "993/tcp"),
 		tc.WithWaitStrategy(wait.ForListeningPort("443/tcp")),
 	}
+	for _, name := range m.networks {
+		options = append(options, network.WithNetworkName(nil, name))
+	}
+	return options
 }
 
 func startContainer(t *testing.T, image string, options ...tc.ContainerCustomizer) *tc.DockerContainer {
@@ -176,6 +206,9 @@ func startContainer(t *testing.T, image string, options ...tc.ContainerCustomize
 type machineState struct {
 	Awake            bool
 	Wakes, Shutdowns int
+	// Packets counts magic packets as "mac@ip", ip being the backend address
+	// they arrived on.
+	Packets map[string]int
 }
 
 func (m machine) state(t *testing.T) machineState {
@@ -264,6 +297,30 @@ machine = "backend"
 listen_port = 993
 destination = "backend:19090"
 `
+
+// twoInterfaceConfig describes a backend with an interface on each of two
+// networks. The first is listed with a MAC that cannot wake it, as when a wired
+// link is down, so the wake has to come through the second.
+const twoInterfaceConfig = configHeader + `[[machines]]
+name = "backend"
+broadcast_ip = "backend"
+wol_port = 9009
+health_check = "http://backend:18080/health"
+[[machines.interfaces]]
+mac_address = "` + deadInterfaceMAC + `"
+[[machines.interfaces]]
+mac_address = "` + wakingInterfaceMAC + `"
+broadcast_ip = "backend-wifi"
+[[routes]]
+machine = "backend"
+hostname = "service.test"
+destination = "http://backend:18080"
+`
+
+const (
+	deadInterfaceMAC   = "02:00:00:00:00:02"
+	wakingInterfaceMAC = "02:00:00:00:00:01"
+)
 
 const legacyConfig = configHeader + "[[targets]]\n" + machineFields + `
 health_endpoint = "http://backend:18080/health"

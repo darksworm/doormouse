@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -228,7 +229,8 @@ type mockWOLSender struct {
 	mu     sync.Mutex
 	calls  []wolCall
 	err    error
-	signal chan struct{} // receives on each call, for synchronisation
+	errFor map[string]error // per-MAC failures, for a machine with several interfaces
+	signal chan struct{}    // receives on each call, for synchronisation
 }
 
 func newMockWOLSender() *mockWOLSender {
@@ -238,12 +240,22 @@ func newMockWOLSender() *mockWOLSender {
 func (m *mockWOLSender) SendWOL(mac, ip string, port int) error {
 	m.mu.Lock()
 	m.calls = append(m.calls, wolCall{mac, ip, port})
+	err := m.err
+	if macErr, ok := m.errFor[mac]; ok {
+		err = macErr
+	}
 	m.mu.Unlock()
 	select {
 	case m.signal <- struct{}{}:
 	default:
 	}
-	return m.err
+	return err
+}
+
+func (m *mockWOLSender) sentCalls() []wolCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]wolCall(nil), m.calls...)
 }
 
 func (m *mockWOLSender) callCount() int {
@@ -401,8 +413,7 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 		Name: testMachineName,
 		Config: &MachineConfig{
 			HealthCheck:     backendURL + "/health",
-			MacAddress:      "AA:BB:CC:DD:EE:FF",
-			BroadcastIP:     "255.255.255.255",
+			Interfaces:      []WOLInterface{{MacAddress: "AA:BB:CC:DD:EE:FF", BroadcastIP: "255.255.255.255"}},
 			WolPort:         9,
 			SSHHost:         "server.local",
 			SSHUser:         "admin",
@@ -882,6 +893,36 @@ destination = "http://nas.local"
 	mustContain(t, err, "health_chek")
 }
 
+func TestLoadConfig_MachineKeyBelowAnInterfaceBlockExplainsTheOrdering(t *testing.T) {
+	// TOML hands health_check to the interface above it. Reported as a bare
+	// unknown key, that reads like a typo in a key that is spelled correctly.
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+
+health_check = "tcp://nas.local:22"
+`+interfacesRoute), RealClock{})
+
+	mustContain(t, err, "machines.interfaces.health_check", "above")
+}
+
+func TestLoadConfig_UnknownMachineKeyGetsNoInterfaceHint(t *testing.T) {
+	_, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_chek = "tcp://nas.local:22"
+`+interfacesRoute), RealClock{})
+
+	mustContain(t, err, "health_chek")
+	if strings.Contains(err.Error(), "interface") {
+		t.Errorf("a typo outside an interface block should not mention interfaces, got: %v", err)
+	}
+}
+
 func TestLoadConfig_MachineHealthCheckMustCarryAUsableScheme(t *testing.T) {
 	// Requiring the key to be non-empty is not enough: Check routes tcp:// to a dialer
 	// and everything else to an HTTP client, so a bare "nas.local:22" is parsed as a
@@ -1081,8 +1122,9 @@ func TestLoadConfig_MachinesAndRoutes(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected machine 'nas', got %v", cfg.Machines)
 	}
-	if machine.Config.MacAddress != "AA:BB:CC:DD:EE:FF" {
-		t.Errorf("MacAddress = %q", machine.Config.MacAddress)
+	wantInterfaces := []WOLInterface{{MacAddress: "AA:BB:CC:DD:EE:FF", BroadcastIP: "255.255.255.255"}}
+	if !reflect.DeepEqual(machine.Config.Interfaces, wantInterfaces) {
+		t.Errorf("Interfaces = %+v, want %+v", machine.Config.Interfaces, wantInterfaces)
 	}
 	if machine.Config.HealthCheck != "tcp://nas.local:22" {
 		t.Errorf("HealthCheck = %q", machine.Config.HealthCheck)
@@ -1382,6 +1424,123 @@ preserve_host = true
 	mustContain(t, err, ":2222", "preserve_host")
 }
 
+const interfacesMachineHeader = machineAndRouteHeader + `
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+`
+
+const interfacesRoute = `
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local"
+`
+
+func TestLoadConfig_MachineWithSeveralInterfaces(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, interfacesMachineHeader+`
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:02"
+broadcast_ip = "192.168.20.255"
+`+interfacesRoute), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The machine's broadcast_ip is the default; an interface on another subnet
+	// overrides it.
+	want := []WOLInterface{
+		{MacAddress: "AA:BB:CC:DD:EE:01", BroadcastIP: "192.168.1.255"},
+		{MacAddress: "AA:BB:CC:DD:EE:02", BroadcastIP: "192.168.20.255"},
+	}
+	if got := cfg.Machines["nas"].Config.Interfaces; !reflect.DeepEqual(got, want) {
+		t.Errorf("Interfaces = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadConfig_InterfaceErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		machine   string
+		fragments []string
+	}{
+		{
+			name: "mac_address and interfaces together",
+			machine: `
+mac_address = "AA:BB:CC:DD:EE:01"
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:02"
+`,
+			fragments: []string{"nas", "mac_address", "interfaces"},
+		},
+		{
+			name: "interface without a mac_address",
+			machine: `
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+broadcast_ip = "192.168.20.255"
+`,
+			fragments: []string{"nas", "interface 1", "needs a mac_address"},
+		},
+		{
+			name: "interface with a mistyped mac_address",
+			machine: `
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE"
+`,
+			fragments: []string{"nas", "interface 2", "AA:BB:CC:DD:EE"},
+		},
+		{
+			name: "interface with no broadcast_ip to fall back on",
+			machine: `
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+`,
+			fragments: []string{"nas", "AA:BB:CC:DD:EE:01", "broadcast_ip"},
+		},
+		{
+			name: "same interface listed twice",
+			machine: `
+broadcast_ip = "192.168.1.255"
+
+[[machines.interfaces]]
+mac_address = "AA:BB:CC:DD:EE:01"
+
+[[machines.interfaces]]
+mac_address = "aa-bb-cc-dd-ee-01"
+`,
+			fragments: []string{"nas", "twice"},
+		},
+		{
+			name: "mistyped top-level mac_address",
+			machine: `
+mac_address = "not-a-mac"
+broadcast_ip = "192.168.1.255"
+`,
+			fragments: []string{"nas", "mac_address", "not-a-mac"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeTempConfig(t, interfacesMachineHeader+tc.machine+interfacesRoute), RealClock{})
+			mustContain(t, err, tc.fragments...)
+		})
+	}
+}
+
 func TestLoadConfig_RouteWithUndialableDestination(t *testing.T) {
 	cfg := strings.Replace(machinesRoutesConfig,
 		`destination = "http://nas.local"`, `destination = "nas.local"`, 1)
@@ -1417,7 +1576,7 @@ func TestLoadConfig_EachLegacyTargetBecomesItsOwnMachineAndRoute(t *testing.T) {
 		}
 	}
 
-	if cfg.Machines["alpha"].Config.MacAddress == cfg.Machines["beta"].Config.MacAddress {
+	if reflect.DeepEqual(cfg.Machines["alpha"].Config.Interfaces, cfg.Machines["beta"].Config.Interfaces) {
 		t.Error("machines should keep their own MAC addresses")
 	}
 }
@@ -2498,8 +2657,8 @@ func TestMigrateConfigFile_WritesAdoptableSidecar(t *testing.T) {
 	if sidecarRoute.Machine.Config.HealthCheck != legacyRoute.Machine.Config.HealthCheck {
 		t.Errorf("HealthCheck %q != %q", sidecarRoute.Machine.Config.HealthCheck, legacyRoute.Machine.Config.HealthCheck)
 	}
-	if sidecarRoute.Machine.Config.MacAddress != legacyRoute.Machine.Config.MacAddress {
-		t.Errorf("MacAddress %q != %q", sidecarRoute.Machine.Config.MacAddress, legacyRoute.Machine.Config.MacAddress)
+	if !reflect.DeepEqual(sidecarRoute.Machine.Config.Interfaces, legacyRoute.Machine.Config.Interfaces) {
+		t.Errorf("Interfaces %+v != %+v", sidecarRoute.Machine.Config.Interfaces, legacyRoute.Machine.Config.Interfaces)
 	}
 }
 
@@ -2859,6 +3018,161 @@ func TestWaitForWake_Timeout(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("test timed out waiting for waitForWake to return")
 	}
+}
+
+// giveSecondInterface adds a Wi-Fi interface on another subnet to the test machine.
+func giveSecondInterface(tp *testProxy) {
+	tp.machine.Config.Interfaces = append(tp.machine.Config.Interfaces,
+		WOLInterface{MacAddress: "AA:BB:CC:DD:EE:02", BroadcastIP: "192.168.20.255"})
+}
+
+func TestSendWOL_ReachesEveryInterface(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+
+	if err := tp.svc.sendWOL(tp.machine); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []wolCall{
+		{"AA:BB:CC:DD:EE:FF", "255.255.255.255", 9},
+		{"AA:BB:CC:DD:EE:02", "192.168.20.255", 9},
+	}
+	if got := tp.wol.sentCalls(); !reflect.DeepEqual(got, want) {
+		t.Errorf("WOL calls = %+v, want %+v", got, want)
+	}
+}
+
+func TestSendWOL_OneFailingInterfaceDoesNotStopTheOthers(t *testing.T) {
+	// The wired interface is unreachable; the Wi-Fi one may still wake the box.
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.errFor = map[string]error{"AA:BB:CC:DD:EE:FF": fmt.Errorf("network is unreachable")}
+
+	if err := tp.svc.sendWOL(tp.machine); err != nil {
+		t.Fatalf("one packet went out, so the wake should carry on, got: %v", err)
+	}
+	if got := tp.wol.callCount(); got != 2 {
+		t.Errorf("WOL calls = %d, want 2: the second interface must still be tried", got)
+	}
+}
+
+// unreachableInterfaceReports counts the log lines about the failing interface.
+func unreachableInterfaceReports(logger *recordingLogger) int {
+	return strings.Count(logger.all(), "AA:BB:CC:DD:EE:FF")
+}
+
+func TestSendWOL_UnreachableInterfaceIsLoggedOncePerWake(t *testing.T) {
+	// Packets are resent every 500ms for the whole timeout. An interface that is
+	// down would otherwise fill the log with the same line.
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.errFor = map[string]error{"AA:BB:CC:DD:EE:FF": fmt.Errorf("network is unreachable")}
+	logger := &recordingLogger{}
+	tp.svc.logger = logger
+
+	for i := 0; i < 3; i++ {
+		if err := tp.svc.sendWOL(tp.machine); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if got := unreachableInterfaceReports(logger); got != 1 {
+		t.Errorf("unreachable interface logged %d times over three sends, want 1:\n%s", got, logger.all())
+	}
+	if !strings.Contains(logger.all(), "network is unreachable") {
+		t.Errorf("the log should say why the interface failed, got:\n%s", logger.all())
+	}
+}
+
+func TestWakeAndWait_ReportsAnUnreachableInterfaceAgainOnTheNextWake(t *testing.T) {
+	// "Once" is per wake: a later wake is a new event, and the interface may have
+	// been fixed and broken again in between.
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.errFor = map[string]error{"AA:BB:CC:DD:EE:FF": fmt.Errorf("network is unreachable")}
+	logger := &recordingLogger{}
+	tp.svc.logger = logger
+
+	// An already-cancelled context ends each wake right after its first send.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 2; i++ {
+		if err := tp.svc.wakeAndWait(ctx, tp.machine); !errors.Is(err, context.Canceled) {
+			t.Fatalf("wake %d: expected the cancelled context, got: %v", i+1, err)
+		}
+	}
+
+	if got := unreachableInterfaceReports(logger); got != 2 {
+		t.Errorf("unreachable interface logged %d times over two wakes, want 2:\n%s", got, logger.all())
+	}
+}
+
+func TestSendWOL_FailsWhenNoInterfaceCouldBeReached(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.wol.err = fmt.Errorf("network is unreachable")
+
+	err := tp.svc.sendWOL(tp.machine)
+	if err == nil {
+		t.Fatal("expected an error when no packet went out")
+	}
+	for _, mac := range []string{"AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:02"} {
+		if !strings.Contains(err.Error(), mac) {
+			t.Errorf("error %q does not name the interface %s", err, mac)
+		}
+	}
+}
+
+func TestSendWOL_MachineWithoutInterfaces(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.machine.Config.Interfaces = nil
+
+	err := tp.svc.sendWOL(tp.machine)
+	if err == nil || !strings.Contains(err.Error(), testMachineName) {
+		t.Errorf("expected an error naming the machine, got: %v", err)
+	}
+}
+
+func TestWakeAndWait_FailsWhenNoWOLPacketCouldBeSent(t *testing.T) {
+	// Waiting out the whole timeout for a machine that was never sent a packet
+	// would only delay the error.
+	tp := newTestProxy(t, nil)
+	tp.wol.err = fmt.Errorf("network is unreachable")
+
+	// The deadline only bounds a regression: without it, a wake that carried on
+	// would wait on the fake clock forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := tp.svc.wakeAndWait(ctx, tp.machine)
+	if err == nil || !strings.Contains(err.Error(), "network is unreachable") {
+		t.Errorf("expected the send failure, got: %v", err)
+	}
+}
+
+func TestWaitForWake_RetransmitsToEveryInterface(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	giveSecondInterface(tp)
+	tp.health.setResult(false)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+	}()
+
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.wol.waitForCalls(t, 2, 5*time.Second)
+
+	calls := tp.wol.sentCalls()
+	if calls[0].mac == calls[1].mac {
+		t.Errorf("one retransmission should reach both interfaces, got %+v", calls)
+	}
+
+	// Let it timeout so the goroutine exits cleanly.
+	tp.clock.Advance(tp.svc.config.Timeout + time.Millisecond)
+	<-result
 }
 
 func TestWaitForWake_WOLRetransmission(t *testing.T) {
