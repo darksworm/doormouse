@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  <strong>A reverse proxy that wakes your servers when someone knocks.</strong>
+  <strong>A reverse proxy that wakes sleeping servers with Wake-on-LAN when someone knocks.</strong>
 </p>
 
 Most homelabs grow one machine that costs real money to run: a NAS with a stack
