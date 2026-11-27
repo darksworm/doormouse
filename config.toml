@@ -18,6 +18,10 @@ server_idle_timeout = "120s"    # How long to wait for the next request when kee
 poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust a cached health result
+# Paths a GET/HEAD must never wake a down machine for: status polls against them
+# get a 503 instead of a magic packet. Defaults to ComfyUI's status endpoints;
+# set an explicit list to replace it, or an empty list to disable the guard.
+#passive_paths = ["/system_stats", "/object_info", "/queue"]
 client_hostname_lookup = false  # Reverse-DNS (PTR) lookup of client IPs for the request log.
                                 # Opt-in: when true, a client IP that is not cached yet is looked
                                 # up synchronously, which can add up to ~1s of latency before the

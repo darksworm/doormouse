@@ -117,6 +117,7 @@ type Config struct {
 	PollInterval          string         `toml:"poll_interval"`
 	HealthCheckInterval   string         `toml:"health_check_interval"`
 	HealthCacheDuration   string         `toml:"health_cache_duration"`
+	PassivePaths          []string       `toml:"passive_paths,omitempty"`
 	SSLCertificate        string         `toml:"ssl_certificate,omitempty"`
 	SSLCertificateKey     string         `toml:"ssl_certificate_key,omitempty"`
 	Targets               []Target       `toml:"targets,omitempty"` // legacy, superseded by machines + routes
@@ -256,10 +257,12 @@ type ProxyConfig struct {
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
-	Machines              map[string]*Machine
-	Routes                []*Route
-	RoutesByHostname      map[string]*Route
-	RoutesByListenPort    map[int]*Route
+	// PassivePaths are request paths that must never wake a down machine.
+	PassivePaths       map[string]bool
+	Machines           map[string]*Machine
+	Routes             []*Route
+	RoutesByHostname   map[string]*Route
+	RoutesByListenPort map[int]*Route
 	SSLCertificate        string
 	SSLCertificateKey     string
 }
@@ -1216,6 +1219,14 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A status poll for a machine nobody is using must not wake it.
+	if p.isPassiveProbe(r) {
+		p.logger.Info("Machine %s appears down (%s), not waking for passive probe %s %s",
+			machineName, reason, r.Method, r.URL.Path)
+		http.Error(w, "Machine is down", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Need to wake up the server
 	p.logger.Info("Machine %s appears down (%s), waking for %s", machineName, reason, route.Name)
 	p.healthChecker.CloseIdleConnections()
@@ -1318,6 +1329,15 @@ func (p *ProxyService) routeForRequest(r *http.Request) *Route {
 	return p.config.RoutesByHostname[host]
 }
 
+// isPassiveProbe reports whether a request only reads status: a GET or HEAD of a
+// configured passive path. Writes to the same paths are real work and still wake.
+func (p *ProxyService) isPassiveProbe(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	return p.config.PassivePaths[r.URL.Path]
+}
+
 func (p *ProxyService) healthCacheStatus(machine *Machine) (cached bool, reason string) {
 	machine.mu.RLock()
 	defer machine.mu.RUnlock()
@@ -1349,7 +1369,9 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 		machine.mu.Unlock()
 		p.logger.Info("Machine %s wake already in progress, joining existing wait",
 			machine.Name)
-		return p.waitForWake(ctx, machine)
+		// The wake leader resends packets; a joiner only polls health, or every
+		// joined request would multiply the magic-packet rate.
+		return p.waitForWake(ctx, machine, false)
 	}
 
 	machine.IsWaking = true
@@ -1375,7 +1397,7 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 	p.logger.Info("WOL packet sent to %s, waiting for server to wake",
 		machine.Name)
 
-	return p.waitForWake(ctx, machine)
+	return p.waitForWake(ctx, machine, true)
 }
 
 // sendWOL sends a magic packet to every interface of the machine. The proxy
@@ -1432,13 +1454,22 @@ func (p *ProxyService) reportWOLFailure(machine *Machine, iface WOLInterface, er
 	}
 }
 
-func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
+func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine, resendPackets bool) error {
 	timeout := p.clock.After(p.config.Timeout)
 	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
 	defer healthCheckTicker.Stop()
 
-	wolTicker := p.clock.NewTicker(500 * time.Millisecond)
-	defer wolTicker.Stop()
+	// Only the wake leader resends packets while waiting. A nil channel blocks
+	// forever, which turns a joiner's wol case into dead weight in the select.
+	var wolTicker Ticker
+	if resendPackets {
+		wolTicker = p.clock.NewTicker(500 * time.Millisecond)
+		defer wolTicker.Stop()
+	}
+	var wolC <-chan time.Time
+	if wolTicker != nil {
+		wolC = wolTicker.C()
+	}
 
 	wakeStartTime := p.clock.Now()
 	p.logger.Info("Waiting for %s to wake (poll interval %v, timeout %v)",
@@ -1451,7 +1482,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
 				machine.Name, p.config.Timeout)
-		case <-wolTicker.C():
+		case <-wolC:
 			// Send additional WOL packets while waiting
 			err := p.sendWOL(machine)
 			if err != nil {
@@ -1773,6 +1804,17 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
+	// passive_paths is optional; omitted means the ComfyUI status endpoints,
+	// which agents poll once a minute and which must not wake the machine. An
+	// explicitly empty list disables the guard.
+	passivePaths := map[string]bool{"/system_stats": true, "/object_info": true, "/queue": true}
+	if config.PassivePaths != nil {
+		passivePaths = make(map[string]bool, len(config.PassivePaths))
+		for _, path := range config.PassivePaths {
+			passivePaths[path] = true
+		}
+	}
+
 	// client_hostname_lookup is optional; unset means disabled. Enabling it is
 	// an explicit opt-in because a cache miss delays the request log line and
 	// the request itself by up to the lookup timeout.
@@ -1810,6 +1852,7 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
+		PassivePaths:          passivePaths,
 		Machines:              model.machines,
 		Routes:                model.routes,
 		RoutesByHostname:      model.byHostname,

@@ -439,6 +439,7 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 		PollInterval:        1 * time.Second,
 		HealthCheckInterval: 30 * time.Second,
 		HealthCacheDuration: 10 * time.Second,
+		PassivePaths:        map[string]bool{"/system_stats": true, "/object_info": true, "/queue": true},
 		Machines:            map[string]*Machine{testMachineName: machineState},
 		Routes:              []*Route{route},
 		RoutesByHostname:    map[string]*Route{testHostname: route},
@@ -1003,6 +1004,74 @@ func TestLoadConfig_AcceptsTheShippedExampleConfig(t *testing.T) {
 	// wrong. Guards the strict unknown-key check against the config we ship.
 	if _, err := LoadConfig("config.toml", RealClock{}); err != nil {
 		t.Fatalf("the shipped config.toml no longer loads: %v", err)
+	}
+}
+
+func TestLoadConfig_PassivePathsDefaultToTheStatusEndpoints(t *testing.T) {
+	// Status polls must never wake a down machine; the ComfyUI endpoints the
+	// agents actually poll are the shipped default.
+	cfg, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local:80"
+`), RealClock{})
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+	for _, path := range []string{"/system_stats", "/object_info", "/queue"} {
+		if !cfg.PassivePaths[path] {
+			t.Errorf("expected %q in the default passive paths, got %v", path, cfg.PassivePaths)
+		}
+	}
+}
+
+func TestLoadConfig_PassivePathsExplicitListOverridesTheDefault(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+passive_paths = ["/status"]
+
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local:80"
+`), RealClock{})
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+	if !cfg.PassivePaths["/status"] {
+		t.Errorf("expected the explicit list to be used, got %v", cfg.PassivePaths)
+	}
+	if cfg.PassivePaths["/system_stats"] {
+		t.Errorf("expected the explicit list to replace the default, got %v", cfg.PassivePaths)
+	}
+}
+
+func TestLoadConfig_EmptyPassivePathsDisablesTheGuard(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, machineAndRouteHeader+`
+passive_paths = []
+
+[[machines]]
+name = "nas"
+health_check = "tcp://nas.local:22"
+
+[[routes]]
+machine = "nas"
+hostname = "files.home.com"
+destination = "http://nas.local:80"
+`), RealClock{})
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+	if len(cfg.PassivePaths) != 0 {
+		t.Errorf("expected an explicitly empty list to disable the guard, got %v", cfg.PassivePaths)
 	}
 }
 
@@ -2944,7 +3013,7 @@ func TestWaitForWake_ContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
 
-	err := tp.svc.waitForWake(ctx, tp.machine)
+	err := tp.svc.waitForWake(ctx, tp.machine, true)
 	if err == nil {
 		t.Fatal("expected error from cancelled context, got nil")
 	}
@@ -2956,7 +3025,7 @@ func TestWaitForWake_Success(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, true)
 	}()
 
 	// 2 tickers (wol + healthCheck) + 1 After (timeout) = 3
@@ -3001,7 +3070,7 @@ func TestWaitForWake_Timeout(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, true)
 	}()
 
 	tp.clock.BlockUntil(3)
@@ -3158,7 +3227,7 @@ func TestWaitForWake_RetransmitsToEveryInterface(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, true)
 	}()
 
 	tp.clock.BlockUntil(3)
@@ -3181,7 +3250,7 @@ func TestWaitForWake_WOLRetransmission(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, true)
 	}()
 
 	tp.clock.BlockUntil(3)
@@ -3806,6 +3875,96 @@ func TestHandleRequest_ExpiredCache_WakesSuccessfully(t *testing.T) {
 	}
 }
 
+func TestHandleRequest_PassiveProbeOnDownMachineDoesNotWake(t *testing.T) {
+	// The motivating case: an agent polling ComfyUI status once a minute must
+	// not resurrect a machine that nobody is using.
+	tp := newTestProxy(t, nil)
+
+	proxy := httptest.NewServer(http.HandlerFunc(tp.svc.handleRequest))
+	defer proxy.Close()
+
+	resp := doRequest(t, proxy.URL+"/system_stats")
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for a status poll against a down machine, got %d", resp.StatusCode)
+	}
+	if got := tp.wol.callCount(); got != 0 {
+		t.Errorf("expected no WOL packets for a status poll, got %d", got)
+	}
+}
+
+func TestHandleRequest_PassiveProbeOnHealthyMachineProxies(t *testing.T) {
+	// The guard only fires while the machine is down; when it is up, status
+	// polls are proxied like any other request.
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tp.machine.mu.Lock()
+	tp.machine.IsHealthy = true
+	tp.machine.LastCheck = tp.clock.Now()
+	tp.machine.mu.Unlock()
+
+	proxy := httptest.NewServer(http.HandlerFunc(tp.svc.handleRequest))
+	defer proxy.Close()
+
+	resp := doRequest(t, proxy.URL+"/system_stats")
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for a status poll against a healthy machine, got %d", resp.StatusCode)
+	}
+	if got := tp.wol.callCount(); got != 0 {
+		t.Errorf("expected no WOL packets for a healthy machine, got %d", got)
+	}
+}
+
+func TestHandleRequest_PostToPassivePathStillWakes(t *testing.T) {
+	// ComfyUI takes prompt submissions on POST /queue; only reads are passive.
+	tp := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tp.health.setResult(true)
+
+	proxy := httptest.NewServer(http.HandlerFunc(tp.svc.handleRequest))
+	defer proxy.Close()
+
+	result := make(chan int, 1)
+	go func() {
+		req, err := http.NewRequest("POST", proxy.URL+"/queue", strings.NewReader("{}"))
+		if err != nil {
+			t.Error(err)
+			result <- 0
+			return
+		}
+		req.Host = testHostname
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			result <- 0
+			return
+		}
+		resp.Body.Close()
+		result <- resp.StatusCode
+	}()
+
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(tp.svc.config.PollInterval)
+
+	select {
+	case code := <-result:
+		if code != 200 {
+			t.Errorf("expected 200 after wake for POST /queue, got %d", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out")
+	}
+
+	if tp.wol.callCount() == 0 {
+		t.Error("expected POST /queue to wake the machine")
+	}
+}
+
 func TestHandleRequest_BackendError(t *testing.T) {
 	// Create backend, close it immediately so any proxy connection fails.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
@@ -4066,9 +4225,10 @@ func TestWakeAndWait_ConcurrentRequests_JoinSingleWake(t *testing.T) {
 	tp.clock.BlockUntil(3)
 
 	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	// The joiner reaches waitForWake too, registering a second set of 3.
-	// Its SendWOL, if any, is recorded before those registrations.
-	tp.clock.BlockUntil(6)
+	// The joiner reaches waitForWake too, registering 1 After + 1 health ticker
+	// (joiners do not resend packets). Its SendWOL, if any, is recorded before
+	// those registrations.
+	tp.clock.BlockUntil(5)
 
 	if got := tp.wol.callCount(); got != 1 {
 		t.Errorf("expected the second request to join the in-progress wake (1 WOL packet), got %d", got)
@@ -4095,11 +4255,39 @@ func TestWakeAndWait_FailedPollCycle_KeepsWakeHeld(t *testing.T) {
 	before := tp.wol.callCount()
 
 	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	tp.clock.BlockUntil(6)
+	// The joiner registers 1 After + 1 health ticker only.
+	tp.clock.BlockUntil(5)
 
 	if got := tp.wol.callCount(); got != before {
 		t.Errorf("expected the later request to join the in-progress wake, got %d extra WOL packet(s)", got-before)
 	}
+}
+
+func TestWaitForWake_JoinerDoesNotResendPackets(t *testing.T) {
+	// Only the wake leader retransmits. Every joined request used to run its own
+	// 500ms wol ticker, multiplying the magic-packet rate by the number of waiters.
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
+	tp.clock.BlockUntil(3)
+
+	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
+	tp.clock.BlockUntil(5)
+
+	// One leader tick: initial packet + exactly one retransmission.
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.wol.waitForCalls(t, 2, 5*time.Second)
+
+	if got := tp.wol.callCount(); got != 2 {
+		t.Errorf("expected exactly 2 WOL packets (leader only), got %d", got)
+	}
+
+	// Let both waiters time out so the goroutines exit cleanly.
+	tp.clock.Advance(tp.svc.config.Timeout + time.Millisecond)
 }
 
 func TestBackgroundCheck_StampsLastCheckFromInjectedClock(t *testing.T) {

@@ -298,6 +298,28 @@ Three forms are accepted: `tcp://host:port`, `http://...` and `https://...`.
 > Readiness is polled only while the machine is live. A machine that sleeps all
 > day therefore generates no per-route traffic.
 
+### Status polls that must not wake
+
+Some clients poll a machine's status endpoints every minute whether or not
+anyone is using it. ComfyUI frontends and agents hammer `GET /system_stats`,
+`GET /object_info` and `GET /queue`; left alone, each poll wakes a sleeping
+machine for nobody's benefit.
+
+Those paths are passive by default: a GET or HEAD of one of them against a down
+machine answers `503 Machine is down` instead of sending a magic packet. The
+machine is woken only by requests that plausibly carry work — anything else, and
+any POST (so `POST /queue`, which submits a prompt in ComfyUI, still wakes).
+
+Tune the list with `passive_paths`:
+
+```toml
+# Replace the default ComfyUI list with your own.
+passive_paths = ["/api/server/ping", "/status"]
+
+# Or disable the guard entirely: every request wakes the machine.
+passive_paths = []
+```
+
 ## Idle shutdown
 
 ```toml
